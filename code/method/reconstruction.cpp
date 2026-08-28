@@ -7,6 +7,7 @@
 #include "../basic/logger.h"
 #include "../basic/progress.h"
 #include "../basic/stop_watch.h"
+#include "../basic/stage_timing.h"
 #include "../basic/file_utils.h"
 #include "../model/kdtree_search.h"
 #include "../model/map_geometry.h"
@@ -31,6 +32,8 @@
 #include <utility>
 #include <CGAL/Delaunay_triangulation_2.h>
 #include <CGAL/interpolation_functions.h>
+#include <algorithm>
+#include <limits>
 
 typedef CGAL::Exact_predicates_inexact_constructions_kernel K;
 typedef K::FT FT;
@@ -56,6 +59,8 @@ void Reconstruction::segmentation(PointSet* pset, Map *footprint, bool simplify_
         Logger::warn("-") << "point cloud data does not exist" << std::endl;
         return;
     }
+
+    StageScope stage_segm("01_segmentation");
 
     // setup intermediate directory
     Method::intermediate_dir = FileUtils::name_less_extension(pset->name()) + "_TEMP";
@@ -113,7 +118,6 @@ void Reconstruction::segmentation(PointSet* pset, Map *footprint, bool simplify_
         kdtree->find_points_in_radius(box.center(), r * r, nbs);
 
         std::vector<unsigned char> inside(nbs.size(), 0);
-#pragma omp parallel for
         for (int i = 0; i < nbs.size(); ++i)
         {
             unsigned int idx = nbs[i];
@@ -186,6 +190,8 @@ bool Reconstruction::extract_roofs(PointSet *pset, Map *footprint)
         return false;
     }
     MapFacetAttribute<VertexGroup::Ptr> buildings(footprint, "buildings");
+
+    StageScope stage_roofs("02_extract_roofs");
 
     if (!pset->has_normals())
         PointSetNormals::estimate(pset);
@@ -315,7 +321,6 @@ PointSet *Reconstruction::create_projected_point_set(const PointSet *pset, const
     kdtree->find_points_in_radius(box.center(), r * r, nbs);
 
     std::vector<unsigned char> inside(nbs.size(), 0);
-#pragma omp parallel for
     for (int i = 0; i < nbs.size(); ++i)
     {
         unsigned int idx = nbs[i];
@@ -404,13 +409,11 @@ bool Reconstruction::reconstruct(PointSet *pset, Map *footprint, Map *result, Li
     StopWatch t;
     std::size_t num_complex_footprint = 0;
     ProgressLogger progress(footprint->size_of_facets());
-    KdTreeSearch_var kdtree = new KdTreeSearch;
-    kdtree->begin();
-
     int idx = 0;
     FOR_EACH_FACET(Map, footprint, it)
     {
         Logger::out("-") << "processing " << ++idx << "/" << footprint->size_of_facets() << " building..." << std::endl;
+        StageTiming::clear();
 
         const int length = std::to_string(footprint->size_of_facets()).length();
         std::stringstream ss;
@@ -441,7 +444,11 @@ bool Reconstruction::reconstruct(PointSet *pset, Map *footprint, Map *result, Li
         }
 
         std::vector<VertexGroup::Ptr> &roofs = g->children();
-        PointSet::Ptr roof_pset = create_roof_point_set(pset, roofs, g);
+        PointSet::Ptr roof_pset;
+        {
+            StageScope stage("03_roof_pointset");
+            roof_pset = create_roof_point_set(pset, roofs, g);
+        }
         roof_pset->set_offset(pset->offset());
         if (roof_pset->groups().empty()) {
             ++num_failed;
@@ -451,7 +458,11 @@ bool Reconstruction::reconstruct(PointSet *pset, Map *footprint, Map *result, Li
             continue;
         }
 
-        PointSet::Ptr image_pset = create_projected_point_set(pset, roof_pset);
+        PointSet::Ptr image_pset;
+        {
+            StageScope stage("04_image_pointset");
+            image_pset = create_projected_point_set(pset, roof_pset);
+        }
         image_pset->set_offset(pset->offset());
 
         if (roof_pset->num_points() < 20) {
@@ -462,7 +473,10 @@ bool Reconstruction::reconstruct(PointSet *pset, Map *footprint, Map *result, Li
             continue;
         }
 
-        const auto line_segs = compute_line_segment(image_pset, roof_pset, it);
+        const auto line_segs = [&]() {
+            StageScope stage("05_line_segments");
+            return compute_line_segment(image_pset, roof_pset, it);
+        }();
 
         int status = -1;
         Map *building = reconstruct_single_building(roof_pset, line_segs, it, solver_name, index_string, status);
@@ -479,6 +493,7 @@ bool Reconstruction::reconstruct(PointSet *pset, Map *footprint, Map *result, Li
         else if (status == 0)   ++num_compromised;
         else                    ++num_failed;
 
+        Logger::out("-") << "    stage times: " << StageTiming::summary() << std::endl;
         roofs.clear();
         progress.next();
     }
@@ -541,17 +556,35 @@ std::vector<std::vector<int>> Reconstruction::compute_height_field(PointSet *pse
     image_delta_res = delta_res;
     double image_zmin = 1e20, image_zmax = 0;
 
+    // footprint bbox for quick rejection of pixels outside it
+    double plg_xmin = std::numeric_limits<double>::max(), plg_ymin = std::numeric_limits<double>::max();
+    double plg_xmax = -std::numeric_limits<double>::max(), plg_ymax = -std::numeric_limits<double>::max();
+    for (std::size_t i = 0; i < plg.size(); ++i) {
+        plg_xmin = std::min(plg_xmin, plg[i].x);
+        plg_ymin = std::min(plg_ymin, plg[i].y);
+        plg_xmax = std::max(plg_xmax, plg[i].x);
+        plg_ymax = std::max(plg_ymax, plg[i].y);
+    }
+
+    // the face containing the previously located pixel seeds the next walk,
+    // keeping each locate near O(1) over the raster scan
+    Face_handle hint = nullptr;
     for (int j = 0; j < image_width; ++j)
     {
         for (int k = 0; k < image_width; ++k)
         {
             FT x = image_x_min + (k) * image_delta_res;
             FT y = image_y_min + (image_width - j - 1) * image_delta_res;
+            if (CGAL::to_double(x) < plg_xmin || CGAL::to_double(x) > plg_xmax ||
+                CGAL::to_double(y) < plg_ymin || CGAL::to_double(y) > plg_ymax)
+                continue;
             Point_3d query_p(x, y, 0);
             vec2 q_p(CGAL::to_double(x), CGAL::to_double(y));
             if (Geom::point_is_in_polygon(plg, q_p))// ensure the pixel point is inside  the footprint
             {
-                Face_handle fh = dt.locate(query_p);
+                Face_handle fh = dt.locate(query_p, hint);
+                if (fh != nullptr)
+                    hint = fh;
                 auto pt0 = fh->vertex(0)->point();
                 auto pt1 = fh->vertex(1)->point();
                 auto pt2 = fh->vertex(2)->point();
@@ -744,10 +777,17 @@ Map *Reconstruction::reconstruct_single_building(PointSet *roof_pset,
 
     // refine planes
     HypothesisGenerator hypo(roof_pset);
-    hypo.refine_planes();
+    {
+        StageScope stage("06_refine_planes");
+        hypo.refine_planes();
+    }
     // generate candidate faces
     PolyFitInfo polyfit_info;
-    Map *hypothesis = hypo.generate(&polyfit_info, footprint, line_segments);
+    Map *hypothesis;
+    {
+        StageScope stage("07_hypothesis");
+        hypothesis = hypo.generate(&polyfit_info, footprint, line_segments);
+    }
     if (!hypothesis) {
         if (!save_footprint(footprint, roof_pset->offset(), footprint_file_name))
             Logger::err("-") << "failed to save footprint as mesh into file: " << footprint_file_name << std::endl;
@@ -774,7 +814,10 @@ Map *Reconstruction::reconstruct_single_building(PointSet *roof_pset,
         // we may compromise: exclude the detected vertical planes and use only those derived from the footprint.
         delete hypothesis;
         std::vector<vec3> detected_line_segments = {};
-        hypothesis = hypo.generate(&polyfit_info, footprint, detected_line_segments);
+        {
+            StageScope stage("07_hypothesis");
+            hypothesis = hypo.generate(&polyfit_info, footprint, detected_line_segments);
+        }
         if (hypothesis->size_of_facets() > Method::max_allowed_candidate_faces) { // still too many
             Logger::err("-") << "too many candidate faces (" << initial_num_candidate_faces << " -> " << hypothesis->size_of_facets() << " by excluding detected lines). Reconstruction skipped, or it would take too much time" << std::endl;
             status = -1;
@@ -788,13 +831,23 @@ Map *Reconstruction::reconstruct_single_building(PointSet *roof_pset,
 
     std::vector<Plane3d *> v = hypo.get_vertical_planes();
     // generate quality measures
-    polyfit_info.generate(roof_pset, hypothesis, v, false);
+    {
+        StageScope stage("08_polyfit_info");
+        polyfit_info.generate(roof_pset, hypothesis, v, false);
+    }
 
     FaceSelection selector(roof_pset, hypothesis);
-    bool success = selector.optimize(&polyfit_info, footprint, v, solver_name);
+    bool success;
+    {
+        StageScope stage("10_face_selection");
+        success = selector.optimize(&polyfit_info, footprint, v, solver_name);
+    }
     if (success) {
-        extrude_boundary_to_ground(hypothesis, Geom::facet_plane(footprint), &polyfit_info);
-        Geom::merge_into_source(hypothesis, footprint);
+        {
+            StageScope stage("11_extrude_merge");
+            extrude_boundary_to_ground(hypothesis, Geom::facet_plane(footprint), &polyfit_info);
+            Geom::merge_into_source(hypothesis, footprint);
+        }
         if (hypothesis->size_of_facets() == 0) {
             delete hypothesis;
             status = -1;

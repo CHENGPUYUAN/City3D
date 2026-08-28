@@ -33,7 +33,11 @@ public:
 #ifdef HAS_GUROBI
 	    GUROBI,
 #endif
-	    SCIP
+	    MINDOPTPY,   // solves via the mindoptpy Python package (community license: no size/time limit)
+#ifdef HAS_HIGHS
+	    HIGHS,       // links libhighs (local build, no license needed)
+#endif
+	    SCIP         // system SCIP (apt scipoptsuite 10.x) if available, else bundled 8.0.3
 	};
 
 	typedef ::LinearProgram<double>	LinearProgram;
@@ -60,6 +64,10 @@ public:
 private:
 #ifdef HAS_GUROBI
 	bool _solve_GUROBI(const LinearProgram* program);
+#endif
+	bool _solve_MINDOPTPY(const LinearProgram* program);
+#ifdef HAS_HIGHS
+	bool _solve_HIGHS(const LinearProgram* program);
 #endif
 	bool _solve_SCIP(const LinearProgram* program);
 

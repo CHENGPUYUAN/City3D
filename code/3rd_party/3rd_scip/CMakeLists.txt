@@ -557,7 +557,8 @@ set(scip_HEADERS
 set(scip_SOURCES
         scip/scipbuildflags.c
         symmetry/compute_symmetry_none.cpp
-        tpi/tpi_none.c
+        tpi/tpi_tnycthrd.c
+        tinycthread/tinycthread.c
         blockmemshell/memory.c
 #        lpi/lpi_spx1.cpp
         lpi/lpi_spx2.cpp
@@ -952,7 +953,10 @@ target_include_directories(${PROJECT_NAME} PRIVATE
         ${POLYFIT_soplex_DIR}/src
         )
 
-target_compile_definitions(${PROJECT_NAME} PUBLIC SCIP_NO_SIGACTION NO_CONFIG_HEADER SCIP_NO_STRTOK_R _CRT_SECURE_NO_WARNINGS TPI_NONE NPARASCIP WITH_SCIPDEF SCIP_ROUNDING_FE)
+target_compile_definitions(${PROJECT_NAME} PUBLIC SCIP_NO_SIGACTION NO_CONFIG_HEADER SCIP_NO_STRTOK_R _CRT_SECURE_NO_WARNINGS TPI_TNYC WITH_SCIPDEF SCIP_ROUNDING_FE)
+
+find_package(Threads REQUIRED)
+target_link_libraries(${PROJECT_NAME} PUBLIC Threads::Threads)
 
 if (MSVC)
     target_compile_definitions(${PROJECT_NAME} PRIVATE

@@ -22,6 +22,8 @@
 #include <iostream>
 #include <assert.h>
 #include <limits.h>
+#include <string.h>
+
 
 #include "spxdefines.h"
 
@@ -341,7 +343,7 @@ public:
       m_memfactor = base.m_memfactor;
       m_used = base.m_used;
       m_hashsize = base.m_hashsize;
-      primes = base.primes;
+      memcpy(primes, base.primes, sizeof(primes));
       nprimes = base.nprimes;
 
       assert(m_memfactor > 1.0);

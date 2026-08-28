@@ -30,7 +30,6 @@ void PointSetNormalizer::apply(double normalized_radius) {
 
 	std::vector<vec3>& points = pset_->points();
 
-#pragma omp parallel for
 	for (int i = 0; i < points.size(); ++i) {
 		points[i] = (normalized_radius_ / radius_) * (points[i] - center_);
 	}
@@ -40,7 +39,6 @@ void PointSetNormalizer::apply(double normalized_radius) {
 void PointSetNormalizer::unapply() {
 	std::vector<vec3>& points = pset_->points();
 
-#pragma omp parallel for
 	for (int i = 0; i < points.size(); ++i) {
 		const vec3& p = points[i];
         vec3 v = (radius_ / normalized_radius_) * p;
@@ -91,7 +89,6 @@ namespace Geom {
 		if (pset && pset->has_normals()) {
 			std::vector<vec3>& normals = pset->normals();
 
-#pragma omp parallel for
 			for (int i = 0; i < group->size(); ++i) {
 				std::size_t idx = group->at(i);
 				normals[idx] = -normals[idx];

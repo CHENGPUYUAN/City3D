@@ -120,7 +120,6 @@ std::vector<VertexGroup::Ptr> RegionGrowingDectetor::detect(
 	pwn.resize(pset->num_points());
 	const std::vector<vec3>& normals = pset->normals();
 	const std::vector<vec3>& points = pset->points();
-#pragma omp parallel for
 	for (int i = 0; i < points.size(); ++i)
 	{
 		const vec3& p = points[i];
@@ -175,7 +174,6 @@ std::vector<VertexGroup::Ptr> RegionGrowingDectetor::detect(
 	p_index.resize(vertitces.size());
 	const std::vector<vec3>& normals = pset->normals();
 	const std::vector<vec3>& points = pset->points();
-#pragma omp parallel for
 	for (int index = 0; index < vertitces.size(); ++index)
 	{
 		std::size_t idx = vertitces[index];
@@ -306,7 +304,6 @@ std::vector<VertexGroup::Ptr> RegionGrowingDectetor::detect(
 	pwn.resize(pset->num_points());
 	const std::vector<vec3>& normals = pset->normals();
 	const std::vector<vec3>& points = pset->points();
-#pragma omp parallel for
 	for (int i = 0; i < points.size(); ++i)
 	{
 		const vec3& p = points[i];
@@ -362,7 +359,6 @@ std::vector<VertexGroup::Ptr> RegionGrowingDectetor::detect(
 	p_index.resize(vertitces.size());
 	const std::vector<vec3>& normals = pset->normals();
 	const std::vector<vec3>& points = pset->points();
-#pragma omp parallel for
 	for (int index = 0; index < vertitces.size(); ++index)
 	{
 		std::size_t idx = vertitces[index];

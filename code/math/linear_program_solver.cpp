@@ -34,6 +34,34 @@ bool LinearProgramSolver::solve(const LinearProgram* program, SolverName solver 
 	case GUROBI:
 		return _solve_GUROBI(program);
 #endif
+	case MINDOPTPY:
+		// transient child-process failures (missing SDK, license server
+		// unreachable, ...) fall back to SCIP, which needs nothing external
+		if (!_solve_MINDOPTPY(program)) {
+			std::cerr << "mindoptpy failed; falling back to SCIP" << std::endl;
+			return _solve_SCIP(program);
+		}
+		return true;
+#ifdef HAS_HIGHS
+	case HIGHS:
+		if (!_solve_HIGHS(program)) {
+			// HiGHS can end with no incumbent at all on hard models (e.g. the
+			// DSM cases at ~50k variables): retry with the other backends before
+			// giving up — MindOpt solved exactly those models to optimality.
+#ifdef HAS_MINDOPTPY
+			std::cerr << "HiGHS failed; falling back to mindoptpy" << std::endl;
+			if (!_solve_MINDOPTPY(program)) {
+				std::cerr << "mindoptpy failed; falling back to SCIP" << std::endl;
+				return _solve_SCIP(program);
+			}
+			return true;
+#else
+			std::cerr << "HiGHS failed; falling back to SCIP" << std::endl;
+			return _solve_SCIP(program);
+#endif
+		}
+		return true;
+#endif
 	case SCIP:
 	default: // use SCIP
 		return _solve_SCIP(program);

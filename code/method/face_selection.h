@@ -58,7 +58,6 @@ class FaceSelection
 
 private:
 	std::vector<std::vector<Map::Facet*> > find_multi_roofs(Map* mesh, Map::Facet* footprint, std::vector<Plane3d*>& v);
-	std::vector<Map::Facet*> overlapping_faces(Map::Facet* f, const std::vector<Map::Facet*>& faces, Map::Facet* footprint);
 
  private:
 	PointSet* pset_;

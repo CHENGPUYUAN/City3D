@@ -25,51 +25,13 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "../model/map_geometry.h"
 #include "../model/map_circulators.h"
 #include "../basic/logger.h"
+#include "../basic/stage_timing.h"
 #include "../model/map_builder.h"
 #include "../model/map_io.h"
 
-std::vector<Map::Facet*> FaceSelection::overlapping_faces(Map::Facet* f,
-                                                          const std::vector<Map::Facet*>& faces,
-                                                          Map::Facet* footprint)
-{
-	vec3 c(0, 0, 0);
-	int degree = 0;
-
-	FacetHalfedgeCirculator cir(f);
-	for (; !cir->end(); ++cir)
-	{
-		c += cir->halfedge()->vertex()->point();
-		++degree;
-	}
-	c /= degree;
-
-	const Plane3d& plane = Geom::facet_plane(footprint);
-	c = plane.projection(c);
-	const vec2& p = plane.to_2d(c);
-
-	std::vector<Map::Facet*> roofs({ f });
-
-	for (std::size_t i = 0; i < faces.size(); ++i)
-	{
-		Map::Facet* face = faces[i];
-		if (f == face)
-			continue;
-
-		Polygon2d plg;
-		FacetHalfedgeCirculator fcir(face);
-		for (; !fcir->end(); ++fcir)
-		{
-			vec3 q = fcir->halfedge()->vertex()->point();
-			q = plane.projection(q);
-			const vec2& r = plane.to_2d(q);
-			plg.push_back(r);
-		}
-		if (Geom::point_is_in_polygon(plg, p))
-			roofs.push_back(face);
-	}
-
-	return roofs;
-}
+#include <algorithm>
+#include <cmath>
+#include <limits>
 
 std::vector<std::vector<Map::Facet*> > FaceSelection::find_multi_roofs(Map* mesh,
 	Map::Facet* footprint,
@@ -90,11 +52,107 @@ std::vector<std::vector<Map::Facet*> > FaceSelection::find_multi_roofs(Map* mesh
 		if (count == v.size())
 			faces.push_back(it);
 	}
-	std::vector<std::vector<Map::Facet*> > multiple_roofs;
+	if (faces.size() < 2)
+		return {};
+
+	const Plane3d& plane = Geom::facet_plane(footprint);
+
+	// Project each face onto the footprint plane once and cache its 2D polygon,
+	// bbox, and centroid (the original code rebuilt every polygon for every
+	// query point, i.e. O(F^2) polygon constructions).
+	struct FaceInfo
+	{
+		Map::Facet* face;
+		Polygon2d  plg;
+		vec2       centroid;
+		double     xmin, ymin, xmax, ymax;
+	};
+	std::vector<FaceInfo> infos;
+	infos.reserve(faces.size());
+	double gmin_x = std::numeric_limits<double>::max(), gmin_y = std::numeric_limits<double>::max();
+	double gmax_x = -std::numeric_limits<double>::max(), gmax_y = -std::numeric_limits<double>::max();
 	for (std::size_t i = 0; i < faces.size(); ++i)
 	{
-		Map::Facet* ft = faces[i];
-		const std::vector<Map::Facet*>& roofs = overlapping_faces(ft, faces, footprint);
+		FaceInfo info;
+		info.face = faces[i];
+		vec3 c(0, 0, 0);
+		int degree = 0;
+		FacetHalfedgeCirculator fcir(info.face);
+		for (; !fcir->end(); ++fcir)
+		{
+			const vec3& q = fcir->halfedge()->vertex()->point();
+			c += q;
+			++degree;
+			vec3 proj = plane.projection(q);
+			info.plg.push_back(plane.to_2d(proj));
+		}
+		c /= degree;
+		info.centroid = plane.to_2d(plane.projection(c));
+
+		info.xmin = info.ymin = std::numeric_limits<double>::max();
+		info.xmax = info.ymax = -std::numeric_limits<double>::max();
+		for (std::size_t j = 0; j < info.plg.size(); ++j)
+		{
+			const vec2& p = info.plg[j];
+			info.xmin = std::min(info.xmin, p.x);
+			info.ymin = std::min(info.ymin, p.y);
+			info.xmax = std::max(info.xmax, p.x);
+			info.ymax = std::max(info.ymax, p.y);
+		}
+		gmin_x = std::min(gmin_x, info.xmin);
+		gmin_y = std::min(gmin_y, info.ymin);
+		gmax_x = std::max(gmax_x, info.xmax);
+		gmax_y = std::max(gmax_y, info.ymax);
+		infos.push_back(info);
+	}
+
+	// Uniform grid: a face is registered in every cell its bbox overlaps. A
+	// point outside a face's closed bbox can never be inside its polygon, so
+	// querying only the cell candidates yields exactly the same containment
+	// results as testing all faces.
+	const int grid_dim = std::max(1, std::min<int>(
+		static_cast<int>(std::sqrt(static_cast<double>(infos.size()))), 512));
+	const double cell_w = std::max((gmax_x - gmin_x) / grid_dim, 1e-12);
+	const double cell_h = std::max((gmax_y - gmin_y) / grid_dim, 1e-12);
+	auto cell_coord = [&](double x, double y, int& cx, int& cy) {
+		cx = std::min(std::max(static_cast<int>((x - gmin_x) / cell_w), 0), grid_dim - 1);
+		cy = std::min(std::max(static_cast<int>((y - gmin_y) / cell_h), 0), grid_dim - 1);
+	};
+
+	std::vector<std::vector<int> > cells(static_cast<std::size_t>(grid_dim) * grid_dim);
+	for (std::size_t i = 0; i < infos.size(); ++i)
+	{
+		const FaceInfo& info = infos[i];
+		int x0, y0, x1, y1;
+		cell_coord(info.xmin, info.ymin, x0, y0);
+		cell_coord(info.xmax, info.ymax, x1, y1);
+		for (int cy = y0; cy <= y1; ++cy)
+			for (int cx = x0; cx <= x1; ++cx)
+				cells[static_cast<std::size_t>(cy) * grid_dim + cx].push_back(static_cast<int>(i));
+	}
+
+	std::vector<std::vector<Map::Facet*> > multiple_roofs;
+	for (std::size_t i = 0; i < infos.size(); ++i)
+	{
+		const FaceInfo& info = infos[i];
+		std::vector<Map::Facet*> roofs({ info.face });
+
+		int cx, cy;
+		cell_coord(info.centroid.x, info.centroid.y, cx, cy);
+		const std::vector<int>& candidates = cells[static_cast<std::size_t>(cy) * grid_dim + cx];
+		for (std::size_t k = 0; k < candidates.size(); ++k)
+		{
+			int j = candidates[k];
+			if (j == static_cast<int>(i))
+				continue;
+			const FaceInfo& other = infos[j];
+			if (info.centroid.x < other.xmin || info.centroid.x > other.xmax ||
+				info.centroid.y < other.ymin || info.centroid.y > other.ymax)
+				continue;
+			if (Geom::point_is_in_polygon(other.plg, info.centroid))
+				roofs.push_back(other.face);
+		}
+
 		if (roofs.size() > 1)
 			multiple_roofs.push_back(roofs);
 	}
@@ -137,7 +195,6 @@ bool FaceSelection::optimize(PolyFitInfo* polyfit_info,
 
 	MapFacetAttribute<bool> is_confident_facet(model_, "is_confident_facet");
 
-
 	//////////////////////////////////////////////////////////////////////////
 
 	double total_points = double(pset_->points().size());
@@ -151,6 +208,10 @@ bool FaceSelection::optimize(PolyFitInfo* polyfit_info,
 	}
     //StopWatch w;
 	const std::vector<FaceStar>& fans = adjacency_.extract(model_, polyfit_info->planes);
+	std::map<const FaceStar*, std::size_t> edge_sharp_status;    // the edge is sharp or not (needed after solving)
+
+	{
+	StageScope stage("09a_lp_build");
 	MapHalfedgeAttribute<bool> is_bound(model_);
 
 	FOR_EACH_HALFEDGE(Map, model_, it)
@@ -194,7 +255,6 @@ bool FaceSelection::optimize(PolyFitInfo* polyfit_info,
 	typedef LinearProgram<double> LinearProgram;
 	Objective obj;
 
-	std::map<const FaceStar*, std::size_t> edge_sharp_status;    // the edge is sharp or not
 	std::size_t num_sharp_edges = 0;
 	for (std::size_t i = 0; i < fans.size(); ++i)
 	{
@@ -358,7 +418,11 @@ bool FaceSelection::optimize(PolyFitInfo* polyfit_info,
 	}
 
 	// Add constraints: single-roof
-	const std::vector<std::vector<Map::Facet*> >& multiple_roofs = find_multi_roofs(model_, footprint, v);
+	std::vector<std::vector<Map::Facet*> > multiple_roofs;
+	{
+		StageScope stage("09a2_multi_roofs");
+		multiple_roofs = find_multi_roofs(model_, footprint, v);
+	}
 	std::set<std::vector<int>> multi_roof_set;
 	for (std::size_t i = 0; i < multiple_roofs.size(); ++i)
 	{
@@ -431,10 +495,16 @@ bool FaceSelection::optimize(PolyFitInfo* polyfit_info,
 		program_.add_constraint(v_constraint);
 	}
 	//////////////////////////////////////////////////////////////////////////
+	} // stage 09a_lp_build
 
 	LinearProgramSolver solver;
-    bool success = solver.solve(&program_, solver_name);
+	bool success;
+	{
+		StageScope stage("09b_lp_solve");
+		success = solver.solve(&program_, solver_name);
+	}
 	if (success) {
+		StageScope stage("09c_lp_postprocess");
 		// mark results
 		const std::vector<double>& X = solver.get_result();
 		std::vector<Map::Facet*> to_delete;

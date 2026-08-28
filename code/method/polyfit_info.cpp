@@ -22,6 +22,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "alpha_shape_mesh.h"
 #include "../basic/logger.h"
 #include "../basic/progress.h"
+#include "../basic/stage_timing.h"
 #include "../model/map_geometry.h"
 #include "../model/point_set.h"
 #include "../model/map_circulators.h"
@@ -127,7 +128,11 @@ void PolyFitInfo::generate(PointSet* pset, Map* mesh, std::vector<Plane3d*>& v, 
 
 	//StopWatch w;
 	//Logger::out("-") << "computing point confidences..." << std::endl;
-	double avg_spacing = compute_point_confidences(pset, 6, 14, 20);
+	double avg_spacing;
+	{
+		StageScope stage("08a_polyfit_confidences");
+		avg_spacing = compute_point_confidences(pset, 6, 14, 20);
+	}
 	double radius = (avg_spacing) * 5.0f;
 	std::vector<VertexGroup::Ptr>& groups = pset->groups();
 	const std::vector<vec3>& pts = pset->points();
@@ -159,6 +164,8 @@ void PolyFitInfo::generate(PointSet* pset, Map* mesh, std::vector<Plane3d*>& v, 
 	ProgressLogger progress(mesh->size_of_facets());
 	int count = 0;
 
+	{
+	StageScope stage("08b_polyfit_facets");
 	FOR_EACH_FACET(Map, mesh, it)
 	{
 		Map::Facet* f = it;
@@ -213,6 +220,7 @@ void PolyFitInfo::generate(PointSet* pset, Map* mesh, std::vector<Plane3d*>& v, 
 		}
 		progress.next();
 	}
+	} // stage 08b_polyfit_facets
 //	Logger::out("-") << " the number of selected vertical facets:   " <<count<< std::endl;
 	facet_attrib_supporting_vertex_group.unbind();
 	facet_attrib_supporting_plane.unbind();

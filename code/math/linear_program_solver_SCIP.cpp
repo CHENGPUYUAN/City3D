@@ -143,9 +143,16 @@ bool LinearProgramSolver::_solve_SCIP(const LinearProgram* program) {
 		SCIP_CALL(SCIPsetIntParam(scip, "presolving/maxrounds", -1));  // enable presolve
 		double MIP_gap = 1e-4;
 		SCIP_CALL(SCIPsetRealParam(scip, "limits/gap", MIP_gap));
+		// same time limit as the GUROBI backend, so one hard model cannot stall
+		// a whole-scene reconstruction forever
+		SCIP_CALL(SCIPsetRealParam(scip, "limits/time", 600.0));
 
 		bool status = false;
 		// this tells scip to start the solution process
+		// NOTE: SCIPsolveConcurrent (the in-library FiberSCIP successor) was
+		// tried here but loses to a single solve at City3D model sizes: the
+		// concurrent instances each rebuild presolve/root from scratch and a
+		// 13k-var model ran 16 solvers for >10 min without finishing.
 		if (SCIPsolve(scip) == SCIP_OKAY) {
 			// get the best found solution from scip
 			SCIP_SOL* sol = SCIPgetBestSol(scip);
