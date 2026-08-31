@@ -30,6 +30,8 @@ class LinearProgramSolver
 {
 public:
 	enum SolverName {
+	    CUOPT,       // remote cuOpt HTTP server on the LAN GPU box (first in auto;
+	                 // transient failures fall back to the local backends)
 #ifdef HAS_GUROBI
 	    GUROBI,
 #endif
@@ -62,6 +64,7 @@ public:
 	const std::vector<double>& get_result() const { return result_; }
 
 private:
+	bool _solve_CUOPT(const LinearProgram* program);
 #ifdef HAS_GUROBI
 	bool _solve_GUROBI(const LinearProgram* program);
 #endif

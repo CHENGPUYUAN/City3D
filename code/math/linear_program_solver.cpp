@@ -30,6 +30,39 @@ bool LinearProgramSolver::solve(const LinearProgram* program, SolverName solver 
 	result_.clear();
 
 	switch (solver) {
+	case CUOPT:
+		// remote GPU server: connection loss / timeout / no solution all fall
+		// back to the best local backend, same as the mindoptpy path below
+		if (!_solve_CUOPT(program)) {
+			std::cerr << "cuOpt failed; falling back to local backends" << std::endl;
+#ifdef HAS_GUROBI
+			return _solve_GUROBI(program);
+#elif defined(HAS_HIGHS)
+			if (!_solve_HIGHS(program)) {
+				std::cerr << "HiGHS failed; falling back" << std::endl;
+#ifdef HAS_MINDOPTPY
+				std::cerr << "falling back to mindoptpy" << std::endl;
+				if (!_solve_MINDOPTPY(program)) {
+					std::cerr << "mindoptpy failed; falling back to SCIP" << std::endl;
+					return _solve_SCIP(program);
+				}
+				return true;
+#else
+				return _solve_SCIP(program);
+#endif
+			}
+			return true;
+#elif defined(HAS_MINDOPTPY)
+			if (!_solve_MINDOPTPY(program)) {
+				std::cerr << "mindoptpy failed; falling back to SCIP" << std::endl;
+				return _solve_SCIP(program);
+			}
+			return true;
+#else
+			return _solve_SCIP(program);
+#endif
+		}
+		return true;
 #ifdef HAS_GUROBI
 	case GUROBI:
 		return _solve_GUROBI(program);

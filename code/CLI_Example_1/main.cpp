@@ -39,7 +39,7 @@ int main(int argc, char **argv)
         std::cerr << "Usage: " << argv[0]
                   << " <input_cloud.(ply|las|laz)> <input_footprint.(obj|geojson)> <output.obj> [pixel_size] [min_points] [solver]"
                   << std::endl;
-        std::cerr << "  solver: gurobi | mindoptpy | highs | scip10 | scip (default: best available)"
+        std::cerr << "  solver: cuopt | gurobi | mindoptpy | highs | scip10 | scip (default: auto = cuopt, falls back to best local)"
                   << std::endl;
         return EXIT_FAILURE;
     }
@@ -101,6 +101,8 @@ int main(int argc, char **argv)
 #else
         solver_ok = false;
 #endif
+    } else if (solver_arg == "cuopt") {
+        solver = LinearProgramSolver::CUOPT;
     } else if (solver_arg == "mindoptpy") {
         solver = LinearProgramSolver::MINDOPTPY;
     } else if (solver_arg == "highs") {
@@ -118,17 +120,11 @@ int main(int argc, char **argv)
     } else if (solver_arg == "scip") {
         solver = LinearProgramSolver::SCIP;
     } else {
-        // auto: best available — gurobi > highs > mindoptpy > scip
+        // auto: best available — cuopt > gurobi > highs > mindoptpy > scip
+        // (cuOpt first: its transient failures fall back to the local chain
+        // inside LinearProgramSolver::solve)
         solver_arg = "auto";
-#ifdef HAS_GUROBI
-        solver = LinearProgramSolver::GUROBI;
-#elif defined(HAS_HIGHS)
-        solver = LinearProgramSolver::HIGHS;
-#elif defined(HAS_MINDOPTPY)
-        solver = LinearProgramSolver::MINDOPTPY;
-#else
-        solver = LinearProgramSolver::SCIP;
-#endif
+        solver = LinearProgramSolver::CUOPT;
     }
     if (!solver_ok) {
         std::cerr << "solver '" << solver_arg << "' is not available in this build" << std::endl;

@@ -676,18 +676,8 @@ void MainWindow::resetRendering() {
 
 
 LinearProgramSolver::SolverName MainWindow::active_solver() const {
-#ifdef HAS_GUROBI
-	Logger::out("-") << "using the Gurobi solver" << std::endl;
-    return LinearProgramSolver::GUROBI;
-#elif defined(HAS_HIGHS)
-	Logger::out("-") << "using the HiGHS solver" << std::endl;
-    return LinearProgramSolver::HIGHS;
-#elif defined(HAS_MINDOPTPY)
-	Logger::out("-") << "using the mindoptpy solver" << std::endl;
-    return LinearProgramSolver::MINDOPTPY;
-#else
-    // default to SCIP
-	Logger::out("-") << "using the SCIP solver" << std::endl;
-    return LinearProgramSolver::SCIP;
-#endif
+    // cuOpt HTTP server first; solve() falls back to the local chain when the
+    // server is down or fails
+	Logger::out("-") << "using the cuOpt server solver" << std::endl;
+    return LinearProgramSolver::CUOPT;
 }

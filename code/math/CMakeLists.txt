@@ -26,6 +26,7 @@ set(math_SOURCES
         linear_program_solver_GUROBI.cpp
         linear_program_solver_MINDOPTPY.cpp
         linear_program_solver_HIGHS.cpp
+        linear_program_solver_CUOPT.cpp
         )
 
 add_library(${PROJECT_NAME} STATIC ${math_SOURCES} ${math_HEADERS})

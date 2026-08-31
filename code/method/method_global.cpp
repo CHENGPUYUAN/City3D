@@ -1,8 +1,16 @@
 #include "method_global.h"
 
+#include <cstdlib>
+
 
 namespace Method
 {
+    // experiments override the candidate-face cap via CITY3D_MAX_FACES
+    static int init_max_faces() {
+        const char* e = std::getenv("CITY3D_MAX_FACES");
+        return e ? std::atoi(e) : 30000;
+    }
+
 
 	double lambda_data_fitting = 0.34;
 	double lambda_model_height = 0.04;
@@ -17,7 +25,7 @@ namespace Method
     double degenerate_face_area_threshold = 1e-8;
 
     //we don't have a solver to handle cases with too many candidate faces
-    int max_allowed_candidate_faces = 30000;
+    int max_allowed_candidate_faces = init_max_faces();
 
 	//________________ names for various quality measures ____________________
 

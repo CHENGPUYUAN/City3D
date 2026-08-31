@@ -40,9 +40,18 @@ std::vector<VertexGroup::Ptr> do_detect(
 {
 	std::vector<VertexGroup::Ptr> results;
 
-	const FT search_sphere_radius = FT(100) / FT(100);
-	const FT max_distance_to_plane = FT(50) / FT(100);
-	const FT max_accepted_angle = FT(30);
+	// Region-growing thresholds, overridable for experiments (DSM rasters are
+	// gridded and noisier than scan clouds; over-segmentation here multiplies
+	// candidate faces quadratically downstream):
+	//   CITY3D_RG_SPHERE_RADIUS (m, default 1.0)
+	//   CITY3D_RG_PLANE_DIST    (m, default 0.5)
+	//   CITY3D_RG_NORMAL_ANGLE  (deg, default 30)
+	const char* env_sphere = std::getenv("CITY3D_RG_SPHERE_RADIUS");
+	const char* env_dist = std::getenv("CITY3D_RG_PLANE_DIST");
+	const char* env_angle = std::getenv("CITY3D_RG_NORMAL_ANGLE");
+	const FT search_sphere_radius = env_sphere ? FT(std::atof(env_sphere)) : FT(100) / FT(100);
+	const FT max_distance_to_plane = env_dist ? FT(std::atof(env_dist)) : FT(50) / FT(100);
+	const FT max_accepted_angle = env_angle ? FT(std::atof(env_angle)) : FT(30);
 	const std::size_t min_region_size = min_support;
 	// Create instances of the classes Neighbor_query and Region_type.
 	Neighbor_query neighbor_query = CGAL::Shape_detection::Point_set::make_sphere_neighbor_query(
@@ -224,9 +233,12 @@ std::vector<VertexGroup::Ptr> do_detect(
 	CGAL::parameters::point_map(pots);
 	CGAL::parameters::normal_map(nos);
 
-	const FT search_sphere_radius = FT(100) / FT(100);
-	const FT max_distance_to_plane = FT(50) / FT(100);
-	const FT max_accepted_angle = FT(30);
+	const char* env_sphere = std::getenv("CITY3D_RG_SPHERE_RADIUS");
+	const char* env_dist = std::getenv("CITY3D_RG_PLANE_DIST");
+	const char* env_angle = std::getenv("CITY3D_RG_NORMAL_ANGLE");
+	const FT search_sphere_radius = env_sphere ? FT(std::atof(env_sphere)) : FT(100) / FT(100);
+	const FT max_distance_to_plane = env_dist ? FT(std::atof(env_dist)) : FT(50) / FT(100);
+	const FT max_accepted_angle = env_angle ? FT(std::atof(env_angle)) : FT(30);
 	const std::size_t min_region_size = min_support;
 	// Create instances of the classes Neighbor_query and Region_type.
 	Neighbor_query neighbor_query(
