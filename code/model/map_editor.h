@@ -59,6 +59,14 @@ public:
 	Halfedge* split_facet(Halfedge* h, Halfedge* g);
 
 	/**
+	* Glue the two facets incident to edge h into a single facet (the edge
+	* is removed). Returns false if the edge is on the border, or if the two
+	* facets are also glued along another edge between the same vertices
+	* (merging through h would leave that edge dangling inside the facet).
+	*/
+	bool merge_facets_along_edge(Halfedge* h);
+
+	/**
 	* Insert a new vertex in the edge referred to by h.
 	* If triangulate is set to true, triangulate the affected facets.
 	*/

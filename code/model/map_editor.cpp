@@ -501,6 +501,90 @@ bool MapEditor::can_collapse_edge(Halfedge* h) {
 	*/
 }
 
+bool MapEditor::merge_facets_along_edge(Halfedge* h) {
+	Halfedge* o = h->opposite();
+	Facet* f1 = h->facet();
+	Facet* f2 = o->facet();
+	if (f1 == nil || f2 == nil || f1 == f2)
+		return false;
+
+	Vertex* vs = h->vertex();
+	Vertex* vt = o->vertex();
+	if (vs == vt)
+		return false;
+
+	// reject pairs of facets glued along another edge between the same two
+	// vertices: merging through h would leave that edge as a self-loop of
+	// the merged facet
+	{
+		Halfedge* rings[2] = { h, o };
+		for (int r = 0; r < 2; ++r) {
+			Halfedge* e = rings[r]->next();
+			while (e != rings[r]) {
+				Vertex* a = e->vertex();
+				Vertex* b = e->opposite()->vertex();
+				if ((a == vs && b == vt) || (a == vt && b == vs))
+					return false;
+				e = e->next();
+			}
+		}
+	}
+
+	// a -> h -> b in f1's ring; c -> o -> d in f2's ring
+	Halfedge* a = h->prev();
+	Halfedge* b = h->next();
+	Halfedge* c = o->prev();
+	Halfedge* d = o->next();
+
+	// vertex keys may point at the halfedges we are about to delete
+	{
+		Vertex* endpoints[2] = { vs, vt };
+		for (int r = 0; r < 2; ++r) {
+			Vertex* v = endpoints[r];
+			Halfedge* key = v->halfedge();
+			if (key == h || key == o) {
+				Halfedge* rep = key->next_around_vertex();
+				while (rep == h || rep == o) {
+					rep = rep->next_around_vertex();
+					if (rep == key)
+						return false; // the vertex would become isolated
+				}
+				set_vertex_halfedge(v, rep);
+			}
+		}
+	}
+
+	bool debug = (std::getenv("CITY3D_DEBUG_MERGE") != nil);
+	static int dump_count = 0;
+	bool dump = debug && dump_count < 2;
+	if (dump) {
+		++dump_count;
+		std::cerr << "[merge] before f1:";
+		for (Halfedge* e = h->next(); e != h; e = e->next()) std::cerr << " (" << e->vertex()->point() << ")";
+		std::cerr << "  f2:";
+		for (Halfedge* e = o->next(); e != o; e = e->next()) std::cerr << " (" << e->vertex()->point() << ")";
+		std::cerr << std::endl;
+	}
+
+	make_sequence(a, d);
+	make_sequence(c, b);
+	set_facet_on_orbit(d, f1);
+	if (f1->halfedge() == h)
+		set_facet_halfedge(f1, b);
+	if (dump) {
+		std::cerr << "[merge] after  :";
+		for (Halfedge* e = b; e != b || true; ) {
+			std::cerr << " (" << e->vertex()->point() << ")";
+			e = e->next();
+			if (e == b) break;
+		}
+		std::cerr << std::endl;
+	}
+	delete_edge(h);
+	delete_facet(f2);
+	return true;
+}
+
 bool MapEditor::collapse_edge(Halfedge* h) {
 
 	if (!can_collapse_edge(h)) {

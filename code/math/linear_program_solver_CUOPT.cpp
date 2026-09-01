@@ -58,14 +58,11 @@ namespace {
 
 // Server address; override with CITY3D_CUOPT_URL (e.g. http://10.0.0.5:8900).
 const char* CUOPT_URL_DEFAULT = "http://192.168.2.156:8900";
-// Sent to the server in solver_config.time_limit; matches the hard limit of
-// the in-process backends. The client waits well past it because the server
-// clock starts only after its own presolve (which alone can take a minute on
-// the DSM models) and encoding the result vector takes tens of seconds more;
-// giving up early would waste the whole solve and trigger a needless local
-// re-solve.
-const double SOLVE_TIME_LIMIT_SEC = 600.0;
-const double CLIENT_DEADLINE_SEC = SOLVE_TIME_LIMIT_SEC + 300.0;
+// The client waits well past the per-solve time_limit (see solver_config)
+// because the server clock starts only after its own presolve (which alone
+// can take a minute on the DSM models) and encoding the result vector takes
+// tens of seconds more; giving up early would waste the whole solve and
+// trigger a needless local re-solve.
 const double POLL_INTERVAL_SEC = 0.5;
 
 bool get_server_host_port(std::string& host, std::string& port) {
@@ -384,7 +381,11 @@ bool LinearProgramSolver::_solve_CUOPT(const LinearProgram* program) {
     jos << "]";
 
     jos << ",\"maximize\":" << (program->objective_sense() == LinearProgram::MAXIMIZE ? "true" : "false");
-    jos << ",\"solver_config\":{\"time_limit\":" << SOLVE_TIME_LIMIT_SEC << "}";
+    // near-optimal guidance: a program may cap its solve time and take the
+    // incumbent; the client deadline scales with it (the server clock starts
+    // only after its presolve, so keep the generous slack)
+    const double time_limit = program->solver_time_limit();
+    jos << ",\"solver_config\":{\"time_limit\":" << time_limit << "}";
     jos << "}}";
 
     // ---- submit ----
@@ -397,10 +398,11 @@ bool LinearProgramSolver::_solve_CUOPT(const LinearProgram* program) {
     }
 
     // ---- poll for the solution ----
+    const double client_deadline = time_limit + 300.0;
     const std::chrono::steady_clock::time_point deadline =
         std::chrono::steady_clock::now() +
         std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-            std::chrono::duration<double>(CLIENT_DEADLINE_SEC));
+            std::chrono::duration<double>(client_deadline));
     const std::string sol_path = "/cuopt/solution/" + req_id;
     int consecutive_failures = 0;
     while (true) {
@@ -451,7 +453,7 @@ bool LinearProgramSolver::_solve_CUOPT(const LinearProgram* program) {
         }
 
         if (std::chrono::steady_clock::now() > deadline) {
-            std::cerr << "cuOpt: no solution within " << CLIENT_DEADLINE_SEC
+            std::cerr << "cuOpt: no solution within " << client_deadline
                       << "s (reqId " << req_id << ")" << std::endl;
             return false;
         }

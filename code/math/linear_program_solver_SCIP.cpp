@@ -141,11 +141,19 @@ bool LinearProgramSolver::_solve_SCIP(const LinearProgram* program) {
 		SCIP_CALL(SCIPsetRealParam(scip, "numerics/feastol", tolerance));
 		SCIP_CALL(SCIPsetRealParam(scip, "numerics/dualfeastol", tolerance));
 		SCIP_CALL(SCIPsetIntParam(scip, "presolving/maxrounds", -1));  // enable presolve
-		double MIP_gap = 1e-4;
-		SCIP_CALL(SCIPsetRealParam(scip, "limits/gap", MIP_gap));
+		// near-optimal guidance: proving optimality is the slow part on hard
+		// models, so a program may relax the gap and cap the time, taking
+		// the incumbent instead of stalling
+		SCIP_CALL(SCIPsetRealParam(scip, "limits/gap", program->solver_mip_gap()));
 		// same time limit as the GUROBI backend, so one hard model cannot stall
 		// a whole-scene reconstruction forever
-		SCIP_CALL(SCIPsetRealParam(scip, "limits/time", 600.0));
+		SCIP_CALL(SCIPsetRealParam(scip, "limits/time", program->solver_time_limit()));
+		if (program->solver_fast_mode()) {
+			// bias the search towards finding good feasible solutions early
+			// instead of deep optimality proofs
+			SCIP_CALL(SCIPsetEmphasis(scip, SCIP_PARAMEMPHASIS_FEASIBILITY, TRUE));
+			SCIP_CALL(SCIPsetHeuristics(scip, SCIP_PARAMSETTING_AGGRESSIVE, TRUE));
+		}
 
 		bool status = false;
 		// this tells scip to start the solution process

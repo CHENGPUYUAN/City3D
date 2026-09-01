@@ -171,9 +171,23 @@ public:
 	const std::vector<Variable>& variables() const { return variables_;	}
 
 	void set_objective(const Objective& obj, Sense sense) {
-		objective_ = obj; 
+		objective_ = obj;
 		objective_sense_ = sense;
 	}
+
+	// Solver guidance for near-optimal solving: proving optimality is what
+	// dominates MIP time on hard parity-style models, so a program may
+	// accept a gap, cap its time (returning the incumbent), and ask the
+	// backends to emphasize finding feasible solutions. Defaults keep the
+	// exact previous behavior of every backend.
+	void set_solver_guidance(double time_limit, double mip_gap, bool fast_mode) {
+		solver_time_limit_ = time_limit;
+		solver_mip_gap_ = mip_gap;
+		solver_fast_mode_ = fast_mode;
+	}
+	double solver_time_limit() const { return solver_time_limit_; }
+	double solver_mip_gap() const { return solver_mip_gap_; }
+	bool solver_fast_mode() const { return solver_fast_mode_; }
 
 	const Objective& objective() const { return objective_; }
 	Sense objective_sense() const { return objective_sense_; }
@@ -249,6 +263,10 @@ private:
 
 	Objective	objective_;
 	Sense		objective_sense_;
+
+	double	solver_time_limit_ = 600.0;
+	double	solver_mip_gap_ = 1e-4;
+	bool	solver_fast_mode_ = false;
 };
 
 

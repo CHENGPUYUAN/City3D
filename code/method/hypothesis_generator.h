@@ -141,6 +141,11 @@ class HypothesisGenerator
 	MapHalfedgeAttribute< std::set<Plane3d*> > edge_source_planes_;
 
 	MapVertexAttribute< std::set<Plane3d*> > vertex_source_planes_;
+
+	// vertical bookkeeping planes of the support-region clipping: they bound
+	// the clipped proxy polygons (as vertex source planes) but never carry
+	// faces and must stay out of the O(n^3) triplet precomputation
+	std::set<Plane3d*> scissor_planes_;
 };
 
 #endif

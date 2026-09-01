@@ -29,7 +29,11 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "../model/map_circulators.h"
 #include "../model/map_geometry.h"
 #include <CGAL/Projection_traits_xy_3.h>
+#include <CGAL/Exact_predicates_exact_constructions_kernel.h>
+#include <CGAL/Boolean_set_operations_2.h>
 #include <algorithm>
+#include <cstdlib>
+#include <list>
 
 #define REMOVE_DEGENERATE_FACES  1
 
@@ -271,10 +275,29 @@ void HypothesisGenerator::collect_valid_planes(PolyFitInfo* polyfit_info,
 	}
 
 
+	// CITY3D_MIN_LINE_LEN (m, default 2.0; 0 = keep all): skip vertical
+	// planes derived from detected line segments shorter than this. Short
+	// segments are weak evidence yet each one adds a cutting plane, and the
+	// number of candidate faces grows roughly quadratically with the plane
+	// count. Measured on case1/case2/case7: no quality change, and unlike
+	// face-level pruning this cannot crack the surface (planes are removed
+	// before the arrangement is built).
+	double min_line_len = 2.0;
+	if (const char* env = std::getenv("CITY3D_MIN_LINE_LEN"))
+		min_line_len = std::atof(env);
+	std::size_t num_short_segments_skipped = 0;
+
 	for (unsigned int id = 0; id < temp_id.size(); ++id)
 	{
 		vec3 v1 = temp_p[temp_id[id][1]];
 		vec3 v2 = temp_p[temp_id[id][2]];
+		vec3 d = v2 - v1;
+		double seg_len = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
+		if (seg_len < min_line_len)
+		{
+			++num_short_segments_skipped;
+			continue;
+		}
 		vec3 v3 = v2;
 		v3[2] = 5.;
 		Plane3d plane(v1, v2, v3);
@@ -285,6 +308,8 @@ void HypothesisGenerator::collect_valid_planes(PolyFitInfo* polyfit_info,
 		g->set_plane(plane);
 		added_vertical_faces.push_back(g);
 	}
+	if (num_short_segments_skipped > 0)
+		Logger::out("    -") << num_short_segments_skipped << " short line segments skipped (CITY3D_MIN_LINE_LEN=" << min_line_len << "m)" << std::endl;
 
 
 	for (std::size_t i = 0; i < added_vertical_faces.size(); ++i)
@@ -397,6 +422,71 @@ static void check_source_planes(Map* mesh)
 	}
 }
 
+
+//////////////////////////////////////////////////////////////////////////
+// Support-region clipping of the proxy faces.
+//
+// By default every detected plane spans the whole footprint, so planes
+// with disjoint support regions still cut each other and the arrangement
+// fills with extrapolated slivers the selection then has to fight (and
+// the closure repair can stack into full "lasagna" sheets). Clipping each
+// plane's proxy polygon to the xy bbox of its points (plus a margin)
+// removes those candidates at the source: far-apart faces simply no
+// longer intersect, so pairwise_cut skips them for free.
+
+namespace {
+
+	typedef CGAL::Exact_predicates_exact_constructions_kernel ExactK;
+	typedef CGAL::Point_2<ExactK>	ExactPoint2;
+	typedef CGAL::Polygon_2<ExactK>	ExactPolygon;
+
+	// Clip the (possibly concave) 2D footprint ring against 'rect' and
+	// return the outer boundary rings of the intersection, each oriented
+	// like the input ring. Returns false when the ring is not simple or
+	// the result is empty or would need holes - the caller then falls back
+	// to the unclipped ring.
+	bool clip_ring_to_rect(const std::vector<ExactPoint2>& ring,
+		const CGAL::Iso_rectangle_2<ExactK>& rect,
+		std::vector<std::vector<ExactPoint2> >& rings)
+	{
+		if (ring.size() < 3)
+			return false;
+
+		ExactPolygon subject(ring.begin(), ring.end());
+		if (!subject.is_simple())
+			return false;
+
+		ExactPolygon clipper;   // ccw, as required by the boolean ops
+		clipper.push_back(rect.vertex(0));  // (xmin, ymin)
+		clipper.push_back(rect.vertex(1));  // (xmax, ymin)
+		clipper.push_back(rect.vertex(2));  // (xmax, ymax)
+		clipper.push_back(rect.vertex(3));  // (xmin, ymax)
+
+		std::list<CGAL::Polygon_with_holes_2<ExactK> > result;
+		CGAL::intersection(subject, clipper, std::back_inserter(result));
+		if (result.empty())
+			return false;
+
+		// the intersection of two simply-connected regions has no holes
+		const bool input_ccw = (subject.orientation() == CGAL::COUNTERCLOCKWISE);
+		for (std::list<CGAL::Polygon_with_holes_2<ExactK> >::iterator it = result.begin();
+			it != result.end(); ++it)
+		{
+			if (it->is_unbounded() || it->has_holes())
+				return false;
+			std::vector<ExactPoint2> r(it->outer_boundary().vertices_begin(),
+				it->outer_boundary().vertices_end());
+			if (r.size() < 3)
+				return false;
+			if (input_ccw != (it->outer_boundary().orientation() == CGAL::COUNTERCLOCKWISE))
+				std::reverse(r.begin(), r.end());
+			rings.push_back(r);
+		}
+		return true;
+	}
+
+} // namespace
+
 Map* HypothesisGenerator::compute_proxy_mesh(PolyFitInfo* polyfit_info, Map::Facet* footprint)
 {
 
@@ -422,52 +512,347 @@ Map* HypothesisGenerator::compute_proxy_mesh(PolyFitInfo* polyfit_info, Map::Fac
 		Map::Halfedge* h = cir->halfedge();
 		ring.push_back(h);
 	}
+	// support-region clipping of the proxy faces: CITY3D_PROXY_MARGIN
+	// (meters, default 2.0; <= 0 disables clipping and every plane spans
+	// the whole footprint as before)
+	double proxy_margin = 2.0;
+	if (const char* env = std::getenv("CITY3D_PROXY_MARGIN"))
+		proxy_margin = std::atof(env);
+
+	// Footprint in 2D, in facet (reversed ring) order so the orientation
+	// matches the original construction. rev[j] is the ring halfedge ending
+	// at facet vertex j, so the facet-order edge j (vertex j -> j+1) is the
+	// ring edge carried by rev[j], and vertex j's two walls are the planes
+	// of the edges j and j-1.
+	std::vector<Map::Halfedge*> rev(ring.rbegin(), ring.rend());
+	const std::size_t num_fp = rev.size();
+	std::vector<ExactPoint2> fp2d;
+	std::vector<Plane3d*> edge_walls;
+	for (std::size_t j = 0; j < num_fp; ++j)
+	{
+		const vec3& s = rev[j]->vertex()->point();
+		fp2d.push_back(ExactPoint2(s.x, s.y));
+		edge_walls.push_back(footprint_edge_derived_plane[rev[j]]);
+	}
+
+	// a non-plane vertex source: either a footprint wall or a clip side
+	struct Src
+	{
+		Plane3d* wall;
+		int side; // -1 when this source is a wall, else 0..3 = W, E, S, N
+		bool operator==(const Src& other) const
+		{
+			return side == other.side && wall == other.wall;
+		}
+	};
+
+	// pass 1: clip every plane's proxy ring to its support region and keep
+	// the classified rings; facets are built later, after the coverage check
+	struct ClipData
+	{
+		bool clipped;
+		double side_coords[4];
+		std::vector<std::vector<ExactPoint2> > rings;
+		std::vector<std::vector<Src> > ring_src; // two sources per ring vertex
+		ClipData() : clipped(false) { side_coords[0] = side_coords[1] = side_coords[2] = side_coords[3] = 0.0; }
+	};
+	std::vector<ClipData> clip_data(planar_segments_.size());
+	std::size_t num_clipped = 0;
+	for (std::size_t i = 0; i < planar_segments_.size(); ++i)
+	{
+		VertexGroup* g = planar_segments_[i];
+		ClipData& cd = clip_data[i];
+
+		if (proxy_margin > 0.0 && g->point_set() != nil && g->size() > 0)
+		{
+			double xmin = 1e30, ymin = 1e30, xmax = -1e30, ymax = -1e30;
+			const std::vector<vec3>& pts = g->point_set()->points();
+			for (std::size_t j = 0; j < g->size(); ++j)
+			{
+				const vec3& q = pts[g->at(j)];
+				xmin = std::min(xmin, double(q.x));
+				ymin = std::min(ymin, double(q.y));
+				xmax = std::max(xmax, double(q.x));
+				ymax = std::max(ymax, double(q.y));
+			}
+
+			for (int attempt = 0; attempt <= 4 && !cd.clipped; ++attempt)
+			{
+				// tiny nudges resolve exact degeneracies (a footprint vertex
+				// lying exactly on a clip side, a footprint edge collinear
+				// with one): they make the "exactly two non-plane sources
+				// per vertex" invariant unachievable, which the validation
+				// below detects
+				double m = proxy_margin + proxy_margin * 1e-4 * attempt * (attempt % 2 ? -1.0 : 1.0);
+				for (int sd = 0; sd < 4; ++sd)
+					cd.side_coords[sd] = (sd == 0 ? xmin : sd == 1 ? xmax : sd == 2 ? ymin : ymax)
+						+ (sd < 2 ? (sd == 0 ? -m : m) : (sd == 2 ? -m : m));
+				CGAL::Iso_rectangle_2<ExactK> rect(
+					ExactPoint2(cd.side_coords[0], cd.side_coords[2]),
+					ExactPoint2(cd.side_coords[1], cd.side_coords[3]));
+
+				if (!clip_ring_to_rect(fp2d, rect, cd.rings))
+					continue;
+
+				// classify every ring vertex: the footprint walls whose edge
+				// contains it and the clip sides it lies on (all exact)
+				cd.ring_src.clear();
+				bool valid = true;
+				for (std::size_t r = 0; r < cd.rings.size() && valid; ++r)
+				{
+					std::vector<Src> srcs;
+					for (std::size_t j = 0; j < cd.rings[r].size() && valid; ++j)
+					{
+						const ExactPoint2& p = cd.rings[r][j];
+						std::vector<Src> s;
+						for (std::size_t k = 0; k < num_fp; ++k)
+						{
+							CGAL::Segment_2<ExactK> seg(fp2d[k], fp2d[(k + 1) % num_fp]);
+							if (seg.has_on(p))
+								s.push_back(Src{ edge_walls[k], -1 });
+						}
+						if (p.x() == ExactK::FT(cd.side_coords[0])) s.push_back(Src{ nil, 0 });
+						if (p.x() == ExactK::FT(cd.side_coords[1])) s.push_back(Src{ nil, 1 });
+						if (p.y() == ExactK::FT(cd.side_coords[2])) s.push_back(Src{ nil, 2 });
+						if (p.y() == ExactK::FT(cd.side_coords[3])) s.push_back(Src{ nil, 3 });
+						if (s.size() != 2)
+							valid = false;
+						else
+							srcs.push_back(s[0]), srcs.push_back(s[1]);
+					}
+					if (valid)
+						cd.ring_src.push_back(srcs);
+				}
+
+				// every consecutive vertex pair must share exactly one
+				// source: the plane the connecting segment lies on (in
+				// addition to the plane of the proxy face itself)
+				for (std::size_t r = 0; r < cd.rings.size() && valid; ++r)
+				{
+					const std::size_t n = cd.rings[r].size();
+					for (std::size_t j = 0; j < n && valid; ++j)
+					{
+						const Src& a = cd.ring_src[r][2 * j];
+						const Src& b = cd.ring_src[r][2 * j + 1];
+						const Src& c = cd.ring_src[r][2 * ((j + 1) % n)];
+						const Src& d = cd.ring_src[r][2 * ((j + 1) % n) + 1];
+						int shared = (a == c) + (a == d) + (b == c) + (b == d);
+						if (shared != 1)
+							valid = false;
+					}
+				}
+
+				if (!valid)
+					continue;
+
+				// drop duplicate consecutive vertices the clip may have
+				// produced; the ring_src entries move with their vertices
+				for (std::size_t r = 0; r < cd.rings.size() && valid; ++r)
+				{
+					std::vector<ExactPoint2> clean_pts;
+					std::vector<Src> clean_src;
+					for (std::size_t j = 0; j < cd.rings[r].size(); ++j)
+					{
+						if (!clean_pts.empty() && clean_pts.back() == cd.rings[r][j])
+							continue;
+						clean_pts.push_back(cd.rings[r][j]);
+						clean_src.push_back(cd.ring_src[r][2 * j]);
+						clean_src.push_back(cd.ring_src[r][2 * j + 1]);
+					}
+					while (clean_pts.size() > 1 && clean_pts.front() == clean_pts.back())
+					{
+						clean_pts.pop_back();
+						clean_src.pop_back();
+						clean_src.pop_back();
+					}
+					if (clean_pts.size() < 3)
+					{
+						valid = false; // collapsed below a triangle: retry
+						break;
+					}
+					cd.rings[r] = clean_pts;
+					cd.ring_src[r] = clean_src;
+				}
+
+				if (valid)
+				{
+					cd.clipped = true;
+					++num_clipped;
+				}
+				else
+				{
+					cd.rings.clear();
+					cd.ring_src.clear();
+				}
+			}
+		}
+	}
+
+	// coverage check: over-clipping can leave footprint regions no plane's
+	// proxy reaches, which means a hole in the candidate set and a leaking
+	// model. If that happens, revert the planes whose support box borders
+	// the uncovered region to the full-footprint ring.
+	if (num_clipped > 0)
+	{
+		CGAL::Polygon_set_2<ExactK> covered;
+		for (std::size_t i = 0; i < clip_data.size(); ++i)
+		{
+			if (!clip_data[i].clipped)
+				continue;
+			for (std::size_t r = 0; r < clip_data[i].rings.size(); ++r)
+			{
+				ExactPolygon ring(clip_data[i].rings[r].begin(), clip_data[i].rings[r].end());
+				if (ring.is_simple())
+					covered.join(ring);
+			}
+		}
+		if (!covered.is_empty())
+		{
+			CGAL::Polygon_set_2<ExactK> uncovered(ExactPolygon(fp2d.begin(), fp2d.end()));
+			uncovered.difference(covered);
+			if (!uncovered.is_empty())
+			{
+				double uncovered_area = 0.0;
+				double gx0 = 1e30, gy0 = 1e30, gx1 = -1e30, gy1 = -1e30;
+				std::list<CGAL::Polygon_with_holes_2<ExactK> > parts;
+				uncovered.polygons_with_holes(std::back_inserter(parts));
+				for (std::list<CGAL::Polygon_with_holes_2<ExactK> >::iterator it = parts.begin();
+					it != parts.end(); ++it)
+				{
+					uncovered_area += std::abs(CGAL::to_double(it->outer_boundary().area()));
+					for (ExactPolygon::Vertex_const_iterator v = it->outer_boundary().vertices_begin();
+						v != it->outer_boundary().vertices_end(); ++v)
+					{
+						gx0 = std::min(gx0, CGAL::to_double(v->x()));
+						gy0 = std::min(gy0, CGAL::to_double(v->y()));
+						gx1 = std::max(gx1, CGAL::to_double(v->x()));
+						gy1 = std::max(gy1, CGAL::to_double(v->y()));
+					}
+				}
+				if (uncovered_area > 0.5) // m^2; smaller slivers are noise
+				{
+					std::size_t num_reverted = 0;
+					for (std::size_t i = 0; i < clip_data.size(); ++i)
+					{
+						const ClipData& cd = clip_data[i];
+						if (!cd.clipped)
+							continue;
+						if (cd.side_coords[1] >= gx0 && cd.side_coords[0] <= gx1 &&
+							cd.side_coords[3] >= gy0 && cd.side_coords[2] <= gy1)
+						{
+							clip_data[i].clipped = false; // rebuilt from the full ring
+							--num_clipped;
+							++num_reverted;
+						}
+					}
+					Logger::warn("    -") << "footprint region of " << uncovered_area
+						<< " m^2 not covered by any clipped proxy; " << num_reverted
+						<< " planes reverted to the full-footprint ring" << std::endl;
+				}
+			}
+		}
+	}
+
+	// pass 2: build the proxy facets
+	std::size_t num_clip_fallbacks = 0;
 	for (std::size_t i = 0; i < planar_segments_.size(); ++i)
 	{
 		VertexGroup* g = planar_segments_[i];
 		Plane3d* plane = vertex_group_plane_[g];
 		assert(plane);
-		builder.begin_facet();
-#if 1    // reverse the orientation to make the entire model well oriented
-		for (std::vector<Map::Halfedge*>::const_reverse_iterator it = ring.rbegin(); it != ring.rend(); ++it)
+		const ClipData& cd = clip_data[i];
+
+		// rings to build: (2d point, the two non-plane source planes)
+		typedef std::pair<ExactPoint2, std::pair<Plane3d*, Plane3d*> > RingVertex;
+		std::vector<std::vector<RingVertex> > rings_to_build;
+
+		if (cd.clipped)
 		{
-#else
-			for (std::vector<Map::Halfedge*>::const_iterator it = ring.begin(); it != ring.end(); ++it) {
-#endif
-			Map::Halfedge* h = *it;
-			Map::Vertex* v = h->vertex();
-			const vec3& s = v->point();
-			const vec3& t = s + vec3(0, 0, 1);
-			vec3 p;
-			if (plane->intersection(Line3d::from_two_points(s, t), p))
+			// materialize the clip sides as vertical bookkeeping planes,
+			// lazily: they only define vertices, never cut anything
+			Plane3d* side_planes[4] = { nil, nil, nil, nil };
+			auto side_plane = [&](int sd) -> Plane3d* {
+				if (side_planes[sd] != nil)
+					return side_planes[sd];
+				Plane3d* sp = nil;
+				if (sd == 0)		sp = new Plane3d(vec3(cd.side_coords[0], 0, 0), vec3(-1, 0, 0));
+				else if (sd == 1)	sp = new Plane3d(vec3(cd.side_coords[1], 0, 0), vec3(1, 0, 0));
+				else if (sd == 2)	sp = new Plane3d(vec3(0, cd.side_coords[2], 0), vec3(0, -1, 0));
+				else				sp = new Plane3d(vec3(0, cd.side_coords[3], 0), vec3(0, 1, 0));
+				scissor_planes_.insert(sp);
+				supporting_planes.push_back(sp);
+				side_planes[sd] = sp;
+				return sp;
+			};
+			auto resolve = [&](const Src& s) -> Plane3d* {
+				return s.side < 0 ? s.wall : side_plane(s.side);
+			};
+			for (std::size_t r = 0; r < cd.rings.size(); ++r)
 			{
-				builder.add_vertex(p);
-				builder.add_vertex_to_facet(idx);
-				++idx;
-
-				Plane3d* plane1 = footprint_edge_derived_plane[h];
-				Plane3d* plane2 = footprint_edge_derived_plane[h->next()];
-				assert(plane1);
-				assert(plane2);
-				assert(plane1 != plane);
-				assert(plane2 != plane);
-				assert(plane2 != plane1);
-				Map::Vertex* cur_v = builder.current_vertex();
-				vertex_source_planes[cur_v].insert(plane);
-				vertex_source_planes[cur_v].insert(plane1);
-				vertex_source_planes[cur_v].insert(plane2);
-			}
-			else
-			{
-				Logger::err() << "vertical line should intersect roof" << std::endl;
-				Logger::err() << plane->normal() << std::endl;
-
+				std::vector<RingVertex> ring_to_build;
+				for (std::size_t j = 0; j < cd.rings[r].size(); ++j)
+					ring_to_build.push_back(std::make_pair(cd.rings[r][j],
+						std::make_pair(resolve(cd.ring_src[r][2 * j]), resolve(cd.ring_src[r][2 * j + 1]))));
+				if (ring_to_build.size() >= 3)
+					rings_to_build.push_back(ring_to_build);
 			}
 		}
-		builder.end_facet();
-		facet_supporting_vertex_group[builder.current_facet()] = g;
-		facet_supporting_plane[builder.current_facet()] = plane;
+		if (rings_to_build.empty())
+		{
+			// fallback: the unclipped full-footprint proxy ring
+			std::vector<RingVertex> ring_to_build;
+			for (std::size_t j = 0; j < num_fp; ++j)
+			{
+				ring_to_build.push_back(std::make_pair(fp2d[j],
+					std::make_pair(edge_walls[j], edge_walls[(j + num_fp - 1) % num_fp])));
+			}
+			rings_to_build.push_back(ring_to_build);
+			++num_clip_fallbacks;
+		}
+
+		for (std::size_t r = 0; r < rings_to_build.size(); ++r)
+		{
+			const std::vector<RingVertex>& ring_to_build = rings_to_build[r];
+			builder.begin_facet();
+			for (std::size_t j = 0; j < ring_to_build.size(); ++j)
+			{
+				const ExactPoint2& q = ring_to_build[j].first;
+				const vec3 s(CGAL::to_double(q.x()), CGAL::to_double(q.y()), 0.0);
+				const vec3 t = s + vec3(0, 0, 1);
+				vec3 p;
+				if (plane->intersection(Line3d::from_two_points(s, t), p))
+				{
+					builder.add_vertex(p);
+					builder.add_vertex_to_facet(idx);
+					++idx;
+
+					Plane3d* plane1 = ring_to_build[j].second.first;
+					Plane3d* plane2 = ring_to_build[j].second.second;
+					assert(plane1 != nil && plane2 != nil);
+					assert(plane1 != plane && plane2 != plane);
+					assert(plane2 != plane1);
+					Map::Vertex* cur_v = builder.current_vertex();
+					vertex_source_planes[cur_v].insert(plane);
+					vertex_source_planes[cur_v].insert(plane1);
+					vertex_source_planes[cur_v].insert(plane2);
+				}
+				else
+				{
+					Logger::err() << "vertical line should intersect roof" << std::endl;
+					Logger::err() << plane->normal() << std::endl;
+
+				}
+			}
+			builder.end_facet();
+			facet_supporting_vertex_group[builder.current_facet()] = g;
+			facet_supporting_plane[builder.current_facet()] = plane;
+		}
 	}
+	if (proxy_margin > 0.0)
+		Logger::out("    -") << num_clipped << "/" << planar_segments_.size()
+			<< " proxy faces clipped to their support region (margin " << proxy_margin
+			<< "m, " << num_clip_fallbacks << " fallbacks)" << std::endl;
+
 	//
 	Box3d m = mesh->bbox();
 	auto height = m.z_max() - m.z_min();
@@ -1087,7 +1472,15 @@ void HypothesisGenerator::triplet_intersection(const std::vector<Plane3d*>& supp
 {
 	triplet_intersection_.clear();
 
-	std::vector<Plane3d*> all_planes = supporting_planes;
+	// skip the scissor planes of the support-region clipping: they multiply
+	// the plane count several-fold and their (few) triplets are computed on
+	// demand by query_intersection's fallback anyway
+	std::vector<Plane3d*> all_planes;
+	for (std::size_t i = 0; i < supporting_planes.size(); ++i)
+	{
+		if (scissor_planes_.find(supporting_planes[i]) == scissor_planes_.end())
+			all_planes.push_back(supporting_planes[i]);
+	}
 	std::sort(all_planes.begin(), all_planes.end());
 
 	for (std::size_t i = 0; i < all_planes.size(); ++i)

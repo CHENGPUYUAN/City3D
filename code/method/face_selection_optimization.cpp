@@ -30,6 +30,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "../model/map_io.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cmath>
 #include <limits>
 
@@ -195,6 +196,14 @@ bool FaceSelection::optimize(PolyFitInfo* polyfit_info,
 
 	MapFacetAttribute<bool> is_confident_facet(model_, "is_confident_facet");
 
+	// Faces marked as having essentially no data support are excluded from
+	// the program entirely (they get no variable). They stay in the mesh:
+	// after solving, the closure repair pulls back the excluded faces that
+	// border the selected surface — they are the structural filler the
+	// "2 or 0" rule would otherwise have forced into the solution.
+	MapFacetAttribute<bool> is_unsupported_facet;
+	is_unsupported_facet.bind_if_defined(model_, "is_unsupported_facet");
+
 	//////////////////////////////////////////////////////////////////////////
 
 	double total_points = double(pset_->points().size());
@@ -203,12 +212,71 @@ bool FaceSelection::optimize(PolyFitInfo* polyfit_info,
 	FOR_EACH_FACET(Map, model_, it)
 	{
 		Map::Facet* f = it;
+		if (is_unsupported_facet.is_bound() && is_unsupported_facet[f])
+			continue; // excluded: no variable
 		facet_indices[f] = idx;
 		++idx;
 	}
     //StopWatch w;
 	const std::vector<FaceStar>& fans = adjacency_.extract(model_, polyfit_info->planes);
 	std::map<const FaceStar*, std::size_t> edge_sharp_status;    // the edge is sharp or not (needed after solving)
+
+	MapFacetAttribute<bool> is_z_outside(model_, "is_z_outside_facet");
+	// Faces whose centroid lies far outside the data's z range are
+	// extrapolation artifacts (the arrangement projects every plane across
+	// the whole footprint, so tilted planes grow corners far above/below
+	// the real geometry), never part of a correct model: pin them to 0.
+	// They stay in the arrangement and keep every fan intact.
+	{
+		const double data_zmax = pset_->bbox().z_max();
+		const double data_zmin = pset_->bbox().z_min();
+		const double z_tol = std::max(1.0, 0.2 * (data_zmax - data_zmin));
+		// experiment switch: CITY3D_ZPIN=0 disables the pinning entirely
+		// (diagnoses whether z-pinning — not the support-point marking —
+		// starves regions of candidates and leaves holes)
+		bool zpin_off = (std::getenv("CITY3D_ZPIN") != nil && std::getenv("CITY3D_ZPIN")[0] == '0');
+		FOR_EACH_FACET(Map, model_, it)
+		{
+			Map::Facet* f = it;
+			if (zpin_off)
+			{
+				is_z_outside[f] = false;
+				continue;
+			}
+			// any vertex outside the band pins the face: long thin faces on
+			// extrapolating planes can keep their centroid well inside the
+			// band while a far corner sticks tens of meters out
+			double fz_min = 1e30, fz_max = -1e30;
+			FacetHalfedgeCirculator cir(f);
+			for (; !cir->end(); ++cir)
+			{
+				double vz = cir->halfedge()->vertex()->point().z;
+				fz_min = std::min(fz_min, vz);
+				fz_max = std::max(fz_max, vz);
+			}
+			is_z_outside[f] = (fz_max > data_zmax + z_tol || fz_min < data_zmin - z_tol);
+		}
+	}
+	auto is_excluded = [&](Map::Facet* f) {
+		return (is_unsupported_facet.is_bound() && is_unsupported_facet[f]) ||
+		       (is_z_outside.is_bound() && is_z_outside[f]);
+	};
+	// z-outside faces are pinned by geometry, not by missing support: the
+	// closure repair must never pull them back in
+	auto repair_eligible = [&](Map::Facet* f) {
+		return is_excluded(f) && !(is_z_outside.is_bound() && is_z_outside[f]);
+	};
+	// number of selectable (non-excluded) members per fan
+	std::vector<std::size_t> fan_active(fans.size(), 0);
+	for (std::size_t i = 0; i < fans.size(); ++i)
+	{
+		const FaceStar& fan = fans[i];
+		for (std::size_t j = 0; j < fan.size(); ++j)
+		{
+			if (!is_excluded(fan[j]->facet()))
+				++fan_active[i];
+		}
+	}
 
 	{
 	StageScope stage("09a_lp_build");
@@ -229,19 +297,28 @@ bool FaceSelection::optimize(PolyFitInfo* polyfit_info,
 		}
 	}
 
-	std::size_t num_faces = model_->size_of_facets();
-	std::size_t num_edges = 0;
-	double bbox_zmax = model_->bbox().z_max();
-	double bbox_zheight = model_->bbox().z_max() - model_->bbox().z_min();
+	std::size_t num_faces = idx; // selectable faces only (excluded ones got no index)
+	std::size_t num_usage_vars = 0;
+	// Height reference from the DATA, not the mesh: the arrangement projects
+	// every plane across the whole footprint, so extrapolating planes grow
+	// corners far outside the real z range and blow up the mesh bbox — a
+	// mesh-bbox reference made tall extrapolation faces (near bbox_zmax)
+	// almost free for the height term, and the solver started picking them.
+	double bbox_zmax = pset_->bbox().z_max();
+	double bbox_zheight = bbox_zmax - pset_->bbox().z_min();
+	// one usage variable per edge with more than two selectable incident
+	// faces (the "2 or 0" constraint below needs it); edges degraded by
+	// excluded faces are left unconstrained — the closure repair after
+	// solving re-adds the filler faces such edges need
 	std::map<const FaceStar*, std::size_t> edge_usage_status;    // keep or remove an intersecting edges
 	for (std::size_t i = 0; i < fans.size(); ++i)
 	{
 		const FaceStar& fan = fans[i];
-		if (fan.size() == 4)
+		if (fan_active[i] > 2)
 		{
-			std::size_t var_idx = num_faces + num_edges;
+			std::size_t var_idx = num_faces + num_usage_vars;
 			edge_usage_status[&fan] = var_idx;
-			++num_edges;
+			++num_usage_vars;
 		}
 	}
     double coeff_data_fitting = Method::lambda_data_fitting;
@@ -259,20 +336,21 @@ bool FaceSelection::optimize(PolyFitInfo* polyfit_info,
 	for (std::size_t i = 0; i < fans.size(); ++i)
 	{
 		const FaceStar& fan = fans[i];
-		if (fan.size() == 4)
+		if (fan.size() == 4 && fan_active[i] == 4) // fully intact edge only
 		{
-			std::size_t var_idx = num_faces + num_edges + num_sharp_edges;
+			std::size_t var_idx = num_faces + num_usage_vars + num_sharp_edges;
 			edge_sharp_status[&fan] = var_idx;
 			// accumulate model complexity term
 			obj.add_coefficient(var_idx, coeff_complexity);
 			++num_sharp_edges;
 		}
 	}
-	assert(num_edges == num_sharp_edges);
 
 	FOR_EACH_FACET(Map, model_, it)
 	{
 		Map::Facet* f = it;
+		if (is_excluded(f))
+			continue;
 		std::size_t var_idx = facet_indices[f];
 		vec3 c(0, 0, 0);
 		int degree = 0;
@@ -311,7 +389,7 @@ bool FaceSelection::optimize(PolyFitInfo* polyfit_info,
 	}
 	program_.set_objective(obj, LinearProgram::MINIMIZE);
 
-	std::size_t total_variables = num_faces + num_edges + num_sharp_edges;
+	std::size_t total_variables = num_faces + num_usage_vars + num_sharp_edges;
 	typedef LinearProgram::Variable Variable;
 	for (std::size_t i = 0; i < total_variables; ++i)
 	{
@@ -324,25 +402,26 @@ bool FaceSelection::optimize(PolyFitInfo* polyfit_info,
 
 	typedef LinearProgram::Constraint Constraint;
 
-	// Add constraints: the number of faces associated with an edge must be either 2 or 0
-	std::size_t var_edge_used_idx = 0;
+	// Add constraints: the number of faces associated with an edge must be either 2 or 0.
+	// Edges degraded by excluded faces (fewer than three selectable members
+	// left) stay unconstrained — the LP may select one side alone, and the
+	// closure repair after solving pulls the excluded filler face back in.
 	for (std::size_t i = 0; i < fans.size(); ++i)
 	{
 		const FaceStar& fan = fans[i];
 
-		if (fan.size() > 2)
+		if (fan_active[i] > 2)
 		{
 			Constraint constraint;
 			for (std::size_t j = 0; j < fan.size(); ++j)
 			{
 				MapTypes::Facet* f = fan[j]->facet();
-				std::size_t var_idx = facet_indices[f];
-				constraint.add_coefficient(var_idx, 1.0);
+				if (is_excluded(f))
+					continue;
+				constraint.add_coefficient(facet_indices[f], 1.0);
 			}
 
-			std::size_t var_idx = num_faces + var_edge_used_idx;
-			constraint.add_coefficient(var_idx, -2.0);  // 
-			++var_edge_used_idx;
+			constraint.add_coefficient(edge_usage_status[&fan], -2.0);  //
 			constraint.set_bounds(Constraint::FIXED, 0.0, 0.0);
 			program_.add_constraint(constraint);
 		}
@@ -351,6 +430,8 @@ bool FaceSelection::optimize(PolyFitInfo* polyfit_info,
 	FOR_EACH_FACET(Map, model_, it)
 	{
 		Map::Facet* f = it;
+		if (is_excluded(f))
+			continue;
 		auto v_plane = facet_attrib_supporting_plane_[f];
 		bool v_face = false;
 		for (int i = 0; i < v.size(); ++i)
@@ -374,12 +455,12 @@ bool FaceSelection::optimize(PolyFitInfo* polyfit_info,
 		}
 	}
 
-	// Add constraints: for the sharp edges
+	// Add constraints: for the sharp edges (fully intact degree-4 edges only)
 	double M = 1.0;
 	for (std::size_t i = 0; i < fans.size(); ++i)
 	{
 		const FaceStar& fan = fans[i];
-		if (fan.size() != 4)
+		if (fan.size() != 4 || fan_active[i] != 4)
 			continue;
 
 		Constraint edge_used_constraint;
@@ -427,14 +508,20 @@ bool FaceSelection::optimize(PolyFitInfo* polyfit_info,
 	for (std::size_t i = 0; i < multiple_roofs.size(); ++i)
 	{
 		const std::vector<Map::Facet*>& roofs = multiple_roofs[i];
+		if (is_excluded(roofs[0]))
+			continue; // group owned by an excluded face: wouldn't exist without it
 		std::set<int> temp;
 		std::vector<int> face_index;
 		for (std::size_t j = 0; j < roofs.size(); ++j)
 		{
 			Map::Facet* f = roofs[j];
+			if (is_excluded(f))
+				continue;
 			std::size_t fid = facet_indices[f];
 			temp.insert(fid);
 		}
+		if (temp.size() < 2)
+			continue; // would pin a single remaining face
 		face_index.insert(face_index.end(), temp.begin(), temp.end());
 		multi_roof_set.insert(face_index);
 
@@ -449,7 +536,12 @@ bool FaceSelection::optimize(PolyFitInfo* polyfit_info,
 			std::size_t fid = roofs[j];
 			constraint.add_coefficient(fid, 1.0);
 		}
-		constraint.set_bounds(Constraint::FIXED, 1.0, 1.0);
+		// "at most one" instead of "exactly one": a stack whose faces also
+		// meet along one arrangement edge must satisfy the even "2 or 0"
+		// fan rule, and forcing exactly one (odd) there makes the program
+		// infeasible. This configuration is data-dependent and shows up
+		// with the unsupported-face exclusion, so defuse the whole class.
+		constraint.set_bounds(Constraint::UPPER, 0.0, 1.0);
 		program_.add_constraint(constraint);
 	}
 
@@ -458,6 +550,8 @@ bool FaceSelection::optimize(PolyFitInfo* polyfit_info,
 	FOR_EACH_FACET(Map, model_, it)
 	{
 		Map::Facet* f = it;
+		if (is_excluded(f))
+			continue;
 		bool vertical_facet = false;
 		for (std::size_t k = 0; k < v.size(); k++)
 		{
@@ -497,6 +591,20 @@ bool FaceSelection::optimize(PolyFitInfo* polyfit_info,
 	//////////////////////////////////////////////////////////////////////////
 	} // stage 09a_lp_build
 
+	// Near-optimal guidance for the selection program: MIP time on the
+	// marked hard cases swings from seconds to minutes between runs, and
+	// proving the last fraction of optimality never changed the geometry.
+	// A gap plus a time cap keeps the whole reconstruction predictable;
+	// the defaults are loose enough that easy models still solve exactly.
+	{
+		double lp_time = 20.0, lp_gap = 1e-3;
+		if (const char* env = std::getenv("CITY3D_LP_TIME"))
+			lp_time = std::atof(env);
+		if (const char* env = std::getenv("CITY3D_LP_GAP"))
+			lp_gap = std::atof(env);
+		program_.set_solver_guidance(lp_time, lp_gap, false);
+	}
+
 	LinearProgramSolver solver;
 	bool success;
 	{
@@ -507,15 +615,241 @@ bool FaceSelection::optimize(PolyFitInfo* polyfit_info,
 		StageScope stage("09c_lp_postprocess");
 		// mark results
 		const std::vector<double>& X = solver.get_result();
+		std::set<Map::Facet*> keep;
+		FOR_EACH_FACET(Map, model_, it)
+		{
+			Map::Facet* f = it;
+			if (is_excluded(f))
+				continue;
+			if (static_cast<int>(std::round(X[facet_indices[f]])) == 1)
+				keep.insert(f);
+		}
+
+		// Closure repair: fans degraded by excluded faces were left
+		// unconstrained, so the selection can end up with an odd number of
+		// kept faces around such an edge. Restore the even "2 or 0" parity
+		// with a minimum-area closure program over the repair-eligible
+		// excluded faces instead of a local greedy walk: pulling back the
+		// same-plane neighbour fan by fan floods whole extrapolated sheets
+		// onto the selection (case7: roof area x10, 80 z-levels instead of
+		// 27). The closure program decides globally which faces complete
+		// the surface with the least added area. z-outside faces stay
+		// pinned to 0 (geometrically absurd), and fans that no filler can
+		// close pay a large slack and may remain odd.
+		const std::size_t lp_kept_count = keep.size();
+		auto greedy_flood = [&]() {
+			bool changed = true;
+			while (changed)
+			{
+				changed = false;
+				for (std::size_t i = 0; i < fans.size(); ++i)
+				{
+					const FaceStar& fan = fans[i];
+					if (fan.size() < 2)
+						continue;
+					std::size_t kept_count = 0;
+					std::set<Plane3d*> kept_planes;
+					for (std::size_t j = 0; j < fan.size(); ++j)
+					{
+						Map::Facet* f = fan[j]->facet();
+						if (f != nil && keep.count(f) != 0)
+						{
+							++kept_count;
+							kept_planes.insert(facet_attrib_supporting_plane_[f]);
+						}
+					}
+					if (kept_count % 2 == 0)
+						continue;
+					Map::Facet* add = nil;
+					for (std::size_t j = 0; j < fan.size() && add == nil; ++j)
+					{
+						Map::Facet* f = fan[j]->facet();
+						if (f == nil || keep.count(f) == 0)
+							continue;
+						Map::Facet* g = fan[j]->opposite()->facet();
+						if (g != nil && keep.count(g) == 0 && repair_eligible(g) &&
+							kept_planes.count(facet_attrib_supporting_plane_[g]) != 0)
+							add = g; // mesh-edge partner on an endorsed plane
+					}
+					if (add == nil)
+					{
+						for (std::size_t j = 0; j < fan.size() && add == nil; ++j)
+						{
+							Map::Facet* g = fan[j]->facet();
+							if (g != nil && keep.count(g) == 0 && repair_eligible(g) &&
+								kept_planes.count(facet_attrib_supporting_plane_[g]) != 0)
+								add = g;
+						}
+					}
+					if (add != nil)
+					{
+						keep.insert(add);
+						changed = true;
+					}
+				}
+			}
+		};
+		{
+			// reverse index: face -> indices of the fans containing it
+			std::map<Map::Facet*, std::vector<std::size_t> > face_fans;
+			for (std::size_t i = 0; i < fans.size(); ++i)
+			{
+				const FaceStar& fan = fans[i];
+				for (std::size_t j = 0; j < fan.size(); ++j)
+				{
+					Map::Facet* f = fan[j]->facet();
+					if (f != nil)
+						face_fans[f].push_back(i);
+				}
+			}
+
+			// relevant fans and filler candidates, breadth-limited around the
+			// selection: the minimal closure never strays far from the
+			// surface boundary, and unbounded candidate sets make the
+			// parity program itself a hard MIP (case1: 25k candidates ran
+			// into the solver time limit). Fans on the last ring stay in the
+			// constraints and may keep an odd remainder via their slack.
+			std::size_t closure_rings = 3;
+			if (const char* env = std::getenv("CITY3D_CLOSURE_RINGS"))
+				closure_rings = std::atoi(env);
+			std::set<std::size_t> relevant_fans;
+			std::set<Map::Facet*> fillers;
+			std::vector<std::pair<Map::Facet*, std::size_t> > worklist;
+			for (std::set<Map::Facet*>::const_iterator it = keep.begin(); it != keep.end(); ++it)
+				worklist.push_back(std::make_pair(*it, std::size_t(0)));
+			while (!worklist.empty())
+			{
+				Map::Facet* f = worklist.back().first;
+				std::size_t depth = worklist.back().second;
+				worklist.pop_back();
+				const std::vector<std::size_t>& f_fans = face_fans[f];
+				for (std::size_t k = 0; k < f_fans.size(); ++k)
+				{
+					std::size_t i = f_fans[k];
+					relevant_fans.insert(i);
+					if (depth >= closure_rings)
+						continue;
+					const FaceStar& fan = fans[i];
+					for (std::size_t j = 0; j < fan.size(); ++j)
+					{
+						Map::Facet* g = fan[j]->facet();
+						if (g == nil || keep.count(g) != 0 || !repair_eligible(g) || fillers.count(g) != 0)
+							continue;
+						fillers.insert(g);
+						worklist.push_back(std::make_pair(g, depth + 1));
+					}
+				}
+			}
+
+			bool closed = false;
+			if (!fillers.empty())
+			{
+				MapFacetAttribute<double> facet_area(model_, Method::facet_attrib_facet_area);
+				typedef LinearProgram<double> ClosureProgram;
+				ClosureProgram closure;
+				std::map<Map::Facet*, std::size_t> filler_idx;
+				ClosureProgram::Objective obj;
+				for (std::set<Map::Facet*>::const_iterator it = fillers.begin(); it != fillers.end(); ++it)
+				{
+					std::size_t idx = filler_idx.size();
+					filler_idx[*it] = idx;
+					// area plus a small per-face term: among closures of
+					// equal area prefer the one with fewer faces
+					obj.add_coefficient(idx, facet_area[*it] + 0.01);
+				}
+				const std::size_t num_filler_vars = filler_idx.size();
+
+				// one u/s pair per fan keeps the variable indices simple;
+				// fans outside the relevant set get free, unused slots
+				for (std::size_t i = 0; i < fans.size(); ++i)
+				{
+					if (relevant_fans.count(i) != 0)
+						obj.add_coefficient(num_filler_vars + 2 * i + 1, 1e4); // penalize odd remainders
+				}
+				closure.set_objective(obj, ClosureProgram::MINIMIZE);
+				// near-optimal guidance: proving optimality on this parity
+				// model is what stalled hard cases for minutes; a small gap
+				// plus a time cap returns the incumbent quickly
+				double closure_time = 20.0, closure_gap = 0.02;
+				if (const char* env = std::getenv("CITY3D_CLOSURE_TIME"))
+					closure_time = std::atof(env);
+				if (const char* env = std::getenv("CITY3D_CLOSURE_GAP"))
+					closure_gap = std::atof(env);
+				closure.set_solver_guidance(closure_time, closure_gap, true);
+
+				for (std::set<std::size_t>::const_iterator it = relevant_fans.begin(); it != relevant_fans.end(); ++it)
+				{
+					std::size_t i = *it;
+					const FaceStar& fan = fans[i];
+					std::size_t kept_count = 0;
+					for (std::size_t j = 0; j < fan.size(); ++j)
+					{
+						Map::Facet* f = fan[j]->facet();
+						if (f != nil && keep.count(f) != 0)
+							++kept_count;
+					}
+					// kept_count + (fillers) + s - 2u = 0: u counts the face
+					// pairs meeting at this edge, s the odd remainder when
+					// no filler set can close the fan
+					ClosureProgram::Constraint constraint;
+					for (std::size_t j = 0; j < fan.size(); ++j)
+					{
+						Map::Facet* g = fan[j]->facet();
+						if (g != nil && filler_idx.count(g) != 0)
+							constraint.add_coefficient(filler_idx[g], 1.0);
+					}
+					constraint.add_coefficient(num_filler_vars + 2 * i + 1, 1.0);
+					constraint.add_coefficient(num_filler_vars + 2 * i, -2.0);
+					constraint.set_bounds(ClosureProgram::Constraint::FIXED,
+						-static_cast<double>(kept_count), -static_cast<double>(kept_count));
+					closure.add_constraint(constraint);
+				}
+
+				for (std::size_t i = 0; i < num_filler_vars; ++i)
+					closure.add_variable(ClosureProgram::Variable(ClosureProgram::Variable::BINARY));
+				for (std::size_t i = 0; i < fans.size(); ++i)
+				{
+					ClosureProgram::Variable u(ClosureProgram::Variable::INTEGER);
+					u.set_bounds(ClosureProgram::Variable::DOUBLE, 0.0, 4.0);
+					closure.add_variable(u);
+					ClosureProgram::Variable s(ClosureProgram::Variable::CONTINUOUS);
+					s.set_bounds(ClosureProgram::Variable::DOUBLE, 0.0, 1.0);
+					closure.add_variable(s);
+				}
+
+				LinearProgramSolver closure_solver;
+				StageScope stage("09c2_closure_solve");
+				if (closure_solver.solve(&closure, solver_name))
+				{
+					const std::vector<double>& Y = closure_solver.get_result();
+					std::size_t added = 0;
+					for (std::map<Map::Facet*, std::size_t>::const_iterator it = filler_idx.begin();
+						it != filler_idx.end(); ++it)
+					{
+						if (static_cast<int>(std::round(Y[it->second])) == 1)
+						{
+							keep.insert(it->first);
+							++added;
+						}
+					}
+					closed = true;
+					Logger::out("-") << "closure program: " << fillers.size() << " candidates, "
+						<< added << " fillers added" << std::endl;
+				}
+				else
+					Logger::warn("-") << "closure program failed, falling back to greedy repair" << std::endl;
+			}
+			if (!closed)
+				greedy_flood();
+		}
+		Logger::out("-") << keep.size() << " faces kept after closure repair (LP selected " << lp_kept_count << ")" << std::endl;
+
 		std::vector<Map::Facet*> to_delete;
 		FOR_EACH_FACET(Map, model_, it)
 		{
 			Map::Facet* f = it;
-			std::size_t idx = facet_indices[f];
-			if (static_cast<int>(std::round(X[idx])) == 0)
-			{
+			if (keep.count(f) == 0)
 				to_delete.push_back(f);
-			}
 		}
 
 		MapEditor editor(model_);
@@ -534,7 +868,7 @@ bool FaceSelection::optimize(PolyFitInfo* polyfit_info,
 		for (std::size_t i = 0; i < fans.size(); ++i)
 		{
 			const FaceStar& fan = fans[i];
-			if (fan.size() != 4)
+			if (fan.size() != 4 || fan_active[i] != 4)
 				continue;
 
 			std::size_t idx_sharp_var = edge_sharp_status[&fan];
@@ -561,6 +895,61 @@ bool FaceSelection::optimize(PolyFitInfo* polyfit_info,
 		FOR_EACH_FACET(Map, model_, it)
 		{
 			normal[it] = facet_attrib_supporting_plane_[it]->normal();
+		}
+
+		// Cosmetic, last: glue adjacent facets that share one supporting
+		// plane back into single polygons. The selection can keep many
+		// coplanar pieces (closure-repair filler); merging leaves the
+		// geometry identical but drops the face count back to a clean
+		// level. Runs after the sharp-edge marking so its halfedge
+		// iteration never touches merged-away edges; the merged edge itself
+		// joins two same-plane faces and can never have been sharp.
+		{
+			// disabled by default: the splice loses area on large merge
+			// chains (case7: roof area halved) — root cause not yet found;
+			// enable with CITY3D_MERGE_OUTPUT=1 to experiment
+			const char* env = std::getenv("CITY3D_MERGE_OUTPUT");
+			if (env == nil || std::atoi(env) == 0) {
+				// skip
+			} else {
+			std::size_t num_merged = 0;
+			bool progress = true;
+			while (progress)
+			{
+				progress = false;
+				std::vector<Map::Halfedge*> candidates;
+				FOR_EACH_HALFEDGE(Map, model_, it)
+				{
+					Map::Halfedge* h = it;
+					if (h > h->opposite())
+						continue; // collect one halfedge per edge only
+					Map::Facet* f1 = h->facet();
+					Map::Facet* f2 = h->opposite()->facet();
+					if (f1 == nil || f2 == nil || f1 == f2)
+						continue;
+					if (facet_attrib_supporting_plane_[f1] != facet_attrib_supporting_plane_[f2])
+						continue;
+					candidates.push_back(h);
+				}
+				for (std::size_t k = 0; k < candidates.size(); ++k)
+				{
+					Map::Halfedge* h = candidates[k];
+					Map::Facet* f1 = h->facet();
+					Map::Facet* f2 = h->opposite()->facet();
+					if (f1 == nil || f2 == nil || f1 == f2)
+						continue; // consumed by an earlier merge in this round
+					if (facet_attrib_supporting_plane_[f1] != facet_attrib_supporting_plane_[f2])
+						continue;
+					if (editor.merge_facets_along_edge(h))
+					{
+						++num_merged;
+						progress = true;
+					}
+				}
+			}
+			if (num_merged > 0)
+				Logger::out("-") << num_merged << " coplanar facet pairs merged for output" << std::endl;
+			}
 		}
 	}
 

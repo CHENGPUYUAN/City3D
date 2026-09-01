@@ -21,6 +21,7 @@
 #include "alpha_shape_boundary.h"
 #include "otr2_edge_simplify.h"
 #include "../model/point_set_io.h"
+#include "../model/map_editor.h"
 #include <CGAL/Exact_predicates_inexact_constructions_kernel.h>
 #include <CGAL/intersections.h>
 #include <CGAL/bounding_box.h>
@@ -34,6 +35,7 @@
 #include <CGAL/interpolation_functions.h>
 #include <algorithm>
 #include <limits>
+#include <cstdlib>
 
 typedef CGAL::Exact_predicates_inexact_constructions_kernel K;
 typedef K::FT FT;
@@ -755,6 +757,68 @@ std::vector<vec3> Reconstruction::compute_line_segment(PointSet *seg_pset,
 }
 
 
+// Mark candidate faces whose supporting plane has essentially no data
+// support, so that the LP is built without them (they get no variable):
+//   CITY3D_MIN_FACE_POINTS  (points,  default 5; 0 = off)
+//   CITY3D_MIN_FACE_DENSITY (pts/m^2, default 0 = off)
+// The marked faces stay in the mesh: after solving, the closure repair in
+// FaceSelection::optimize pulls back the ones bordering the selected
+// surface (they are the structural filler the full "2 or 0" model would
+// have forced in). Deleting them instead cracks the surface open, and
+// pinning them while keeping the fan constraints collapses the selection.
+// Faces on structural planes (detected line segments, footprint edges, the
+// z cut planes) carry no points by construction — their support groups are
+// empty — and are never marked: they are needed to close the model.
+static std::size_t mark_unsupported_candidate_faces(Map* mesh)
+{
+    MapFacetAttribute<bool> unsupported(mesh, "is_unsupported_facet");
+    FOR_EACH_FACET(Map, mesh, it)
+        unsupported[it] = false;
+
+    double min_points = 5.0, min_density = 0.0;
+    if (const char* env = std::getenv("CITY3D_MIN_FACE_POINTS"))
+        min_points = std::atof(env);
+    if (const char* env = std::getenv("CITY3D_MIN_FACE_DENSITY"))
+        min_density = std::atof(env);
+    if (min_points <= 0.0 && min_density <= 0.0)
+        return 0;
+
+    MapFacetAttribute<VertexGroup*> supporting_group(mesh, Method::facet_attrib_supporting_vertex_group);
+    MapFacetAttribute<double> point_num(mesh, Method::facet_attrib_supporting_point_num);
+    MapFacetAttribute<double> area(mesh, Method::facet_attrib_facet_area);
+
+    std::size_t num_marked = 0;
+    FOR_EACH_FACET(Map, mesh, it)
+    {
+        VertexGroup* g = supporting_group[it];
+        if (g == nil || g->size() == 0)
+            continue; // structural plane
+        double n = point_num[it];
+        double a = area[it];
+        if (n < min_points || (min_density > 0.0 && a > 0.0 && n / a < min_density))
+        {
+            unsupported[it] = true;
+            ++num_marked;
+        }
+    }
+    return num_marked;
+}
+
+// candidate faces that remain selectable (i.e. not marked above)
+static std::size_t count_selectable_faces(Map* mesh)
+{
+    MapFacetAttribute<bool> unsupported;
+    if (!unsupported.bind_if_defined(mesh, "is_unsupported_facet"))
+        return mesh->size_of_facets();
+    std::size_t count = 0;
+    FOR_EACH_FACET(Map, mesh, it)
+    {
+        if (!unsupported[it])
+            ++count;
+    }
+    return count;
+}
+
 // 'status' returns one of the following values:
 //      1: successful
 //      0: compromised (due to, e.g., too complex, detected inner wall excluded)
@@ -794,9 +858,33 @@ Map *Reconstruction::reconstruct_single_building(PointSet *roof_pset,
         return nullptr;
     }
 
+    // compute the per-face quality measures, then — only for buildings that
+    // would otherwise exceed the candidate face limit — mark faces with
+    // essentially no data support (the LP pins them to 0). The exclusion
+    // breaks the "2 or 0" fan rule on the degraded edges, and the closure
+    // repair that restores parity afterwards stacks whole extrapolated
+    // sheets on top of the selection (case7: roof area x10, 80 z-levels
+    // instead of 27). Solvable buildings must not pay that price, so the
+    // full program stays intact whenever it fits the limit.
+    std::vector<Plane3d *> v;
+    auto measure_and_mark = [&](Map *mesh) {
+        v = hypo.get_vertical_planes();
+        {
+            StageScope stage("08_polyfit_info");
+            polyfit_info.generate(roof_pset, mesh, v, false);
+        }
+        if (mesh->size_of_facets() > Method::max_allowed_candidate_faces) {
+            StageScope stage("08c_face_mark");
+            std::size_t num_marked = mark_unsupported_candidate_faces(mesh);
+            if (num_marked > 0)
+                Logger::out("-") << num_marked << " unsupported candidate faces marked (pinned to 0)" << std::endl;
+        }
+    };
+    measure_and_mark(hypothesis);
+
     // in case huge number of candidate faces, we may skip the reconstruction (because no solver can solve the involved
     // optimization problem within a reasonable time window).
-    if (hypothesis->size_of_facets() > Method::max_allowed_candidate_faces) {
+    if (count_selectable_faces(hypothesis) > Method::max_allowed_candidate_faces) {
         // save footprint
         if (!save_footprint(footprint, roof_pset->offset(), footprint_file_name))
             Logger::err("-") << "failed to save footprint as mesh into file: " << footprint_file_name << std::endl;
@@ -810,7 +898,7 @@ Map *Reconstruction::reconstruct_single_building(PointSet *roof_pset,
                 output << p << std::endl;
         }
 
-        int initial_num_candidate_faces = hypothesis->size_of_facets();
+        int initial_num_candidate_faces = count_selectable_faces(hypothesis);
         // we may compromise: exclude the detected vertical planes and use only those derived from the footprint.
         delete hypothesis;
         std::vector<vec3> detected_line_segments = {};
@@ -818,7 +906,8 @@ Map *Reconstruction::reconstruct_single_building(PointSet *roof_pset,
             StageScope stage("07_hypothesis");
             hypothesis = hypo.generate(&polyfit_info, footprint, detected_line_segments);
         }
-        if (hypothesis->size_of_facets() > Method::max_allowed_candidate_faces) { // still too many
+        measure_and_mark(hypothesis);
+        if (count_selectable_faces(hypothesis) > Method::max_allowed_candidate_faces) { // still too many
             Logger::err("-") << "too many candidate faces (" << initial_num_candidate_faces << " -> " << hypothesis->size_of_facets() << " by excluding detected lines). Reconstruction skipped, or it would take too much time" << std::endl;
             status = -1;
             return nullptr;
@@ -827,13 +916,6 @@ Map *Reconstruction::reconstruct_single_building(PointSet *roof_pset,
             Logger::warn("-") << "too many candidate faces (" << initial_num_candidate_faces << " -> " << hypothesis->size_of_facets() << " by excluding detected lines). Reconstruction compromised" << std::endl;
             status = 0;
         }
-    }
-
-    std::vector<Plane3d *> v = hypo.get_vertical_planes();
-    // generate quality measures
-    {
-        StageScope stage("08_polyfit_info");
-        polyfit_info.generate(roof_pset, hypothesis, v, false);
     }
 
     FaceSelection selector(roof_pset, hypothesis);

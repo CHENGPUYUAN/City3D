@@ -123,8 +123,11 @@ bool LinearProgramSolver::_solve_MINDOPTPY(const LinearProgram* program) {
 			}
 			jos << "\"lb\":" << lb << ",\"ub\":" << ub << "}";
 		}
+		// near-optimal guidance (see LinearProgram::set_solver_guidance);
+		// the defaults reproduce the previous fixed 600s / 1e-4 settings
+		jos << "],\"time_limit\":" << program->solver_time_limit()
+			<< ",\"mip_gap\":" << program->solver_mip_gap() << "}";
 	}
-	jos << "]}";
 
 	// embedded solver script: reads model file path on argv[1], writes the
 	// solution to argv[1] + ".sol"
@@ -147,7 +150,11 @@ env = Env()
 env.start()
 m = Model("city3d", env)
 m.setParam(mdo.MDO.Param.OutputFlag, 0)
-m.setParam(mdo.MDO.Param.MaxTime, 600.0)
+m.setParam(mdo.MDO.Param.MaxTime, model.get("time_limit", 600.0))
+try:  # gap param name varies across SDK versions; time limit alone suffices
+    m.setParam(mdo.MDO.Param.MIP.RelativeGap, model.get("mip_gap", 1e-4))
+except Exception:
+    pass
 
 vars = model["variables"]
 xs = []
@@ -173,15 +180,21 @@ for con in model["constraints"]:
             m.addConstr(expr <= ub)
 
 m.optimize()
-if m.status != mdo.MDO.OPTIMAL:
-    sys.exit(f"mindopt status {m.status} (1=optimal; see MDO status codes)")
+# A gap-stopped or time-limited run still carries a usable incumbent, and
+# rejecting it would make the caller re-solve the same model from scratch
+# elsewhere. Only give up when no solution can be read at all.
+try:
+    objval = float(m.objval)
+    vals = [float(x.X) for x in xs]
+except Exception:
+    sys.exit(f"mindopt status {m.status} with no usable solution")
 
 with open(path + ".sol", "w") as f:
     # float(): m.objval and .X return np.float64 and numpy 2.x reprs
     # ("np.float64(...)") would break the C++ parser
-    f.write(f"obj {float(m.objval)!r}\n")
-    for i, x in enumerate(xs):
-        f.write(f"{i} {float(x.X)!r}\n")
+    f.write(f"obj {objval!r}\n")
+    for i, v in enumerate(vals):
+        f.write(f"{i} {v!r}\n")
 )PY";
 
 	// model + script temp files
