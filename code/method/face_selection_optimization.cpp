@@ -859,6 +859,81 @@ bool FaceSelection::optimize(PolyFitInfo* polyfit_info,
 			editor.erase_facet(f->halfedge());
 		}
 
+		// Floating-component cleanup (quality safety net): the manifold
+		// rule is local, so the selection can keep small isolated patches
+		// that satisfy "2 or 0" per edge yet connect to nothing. Drop the
+		// components below a small area threshold; the largest component
+		// always stays. CITY3D_FLOAT_AREA (m^2, default 0.5; 0 disables).
+		{
+			double float_area = 0.5;
+			if (const char* env = std::getenv("CITY3D_FLOAT_AREA"))
+				float_area = std::atof(env);
+			if (float_area > 0.0)
+			{
+				MapFacetAttribute<double> facet_area(model_, Method::facet_attrib_facet_area);
+				// adjacency through interior halfedges
+				std::map<Map::Facet*, std::vector<Map::Facet*> > adjacency;
+				FOR_EACH_HALFEDGE(Map, model_, it)
+				{
+					Map::Halfedge* h = it;
+					if (h->facet() == nil)
+						continue;
+					Map::Facet* g = h->opposite()->facet();
+					if (g != nil && g != h->facet())
+						adjacency[h->facet()].push_back(g);
+				}
+				std::set<Map::Facet*> visited;
+				std::vector<std::vector<Map::Facet*> > components;
+				FOR_EACH_FACET(Map, model_, it)
+				{
+					Map::Facet* f = it;
+					if (visited.count(f) != 0)
+						continue;
+					std::vector<Map::Facet*> stack(1, f), comp;
+					visited.insert(f);
+					while (!stack.empty())
+					{
+						Map::Facet* u = stack.back();
+						stack.pop_back();
+						comp.push_back(u);
+						const std::vector<Map::Facet*>& nbrs = adjacency[u];
+						for (std::size_t k = 0; k < nbrs.size(); ++k)
+						{
+							if (visited.insert(nbrs[k]).second)
+								stack.push_back(nbrs[k]);
+						}
+					}
+					components.push_back(comp);
+				}
+				double max_area = 0.0;
+				for (std::size_t i = 0; i < components.size(); ++i)
+				{
+					double a = 0.0;
+					for (std::size_t k = 0; k < components[i].size(); ++k)
+						a += facet_area[components[i][k]];
+					max_area = std::max(max_area, a);
+				}
+				std::size_t num_removed = 0;
+				for (std::size_t i = 0; i < components.size(); ++i)
+				{
+					double a = 0.0;
+					for (std::size_t k = 0; k < components[i].size(); ++k)
+						a += facet_area[components[i][k]];
+					if (a < float_area && a < max_area)
+					{
+						for (std::size_t k = 0; k < components[i].size(); ++k)
+						{
+							editor.erase_facet(components[i][k]->halfedge());
+							++num_removed;
+						}
+					}
+				}
+				if (num_removed > 0)
+					Logger::out("-") << num_removed << " floating faces removed (components < "
+						<< float_area << " m^2)" << std::endl;
+			}
+		}
+
 		//////////////////////////////////////////////////////////////////////////
 
 		// mark the sharp edges
