@@ -974,38 +974,177 @@ void Reconstruction::extrude_boundary_to_ground(Map *model, const Plane3d &groun
 {
 #ifdef SIMPLE_EXTRUSION // a planar wall might contain multiple pieces
 
-    MapHalfedgeAttribute<bool> is_boundary(model, "is_boundary");
+    // Experiment, CITY3D_OPEN_WALLS=1: recompute the open edges from the
+    // FINAL mesh instead of trusting the "is_boundary" attribute. That flag
+    // is derived from the arrangement fans before the selection deletes
+    // faces, so an edge whose co-located partner got deleted (pinned filler,
+    // floating cleanup) reads as interior there yet is single-used in the
+    // result - a hole. Cut edges are duplicated per face (each face keeps
+    // its own halfedges), so match them by exact endpoint coordinates: the
+    // cut machinery derives every copy of a point from the same cached
+    // plane-triplet intersection, making the doubles bit-identical.
+    // Wall bottoms stop at the highest selected face below the edge so
+    // mid-roof steps do not punch through the storeys underneath; edges
+    // with no face below them still grow full-height walls, which is why
+    // this stays off by default until the support regions tile properly.
+    const bool open_walls = (std::getenv("CITY3D_OPEN_WALLS") != nil
+        && std::getenv("CITY3D_OPEN_WALLS")[0] == '1');
     std::vector<Polygon3d> polygons;
+
+    if (!open_walls)
+    {
+        // original behavior: extrude the edges the fan analysis marked as
+        // boundary before the selection ran
+        MapHalfedgeAttribute<bool> is_boundary(model, "is_boundary");
+        FOR_EACH_HALFEDGE(Map, model, it)
+        {
+            if (!is_boundary[it])
+                continue;
+            const vec3 &a = it->vertex()->point();
+            const vec3 &b = it->opposite()->vertex()->point();
+            const vec3 &c = ground.projection(b);
+            const vec3 &d = ground.projection(a);
+            if (length(c - d) > 1e-4)
+            {
+                Polygon3d plg;
+                plg.push_back(a);
+                plg.push_back(b);
+                plg.push_back(c);
+                plg.push_back(d);
+                polygons.push_back(plg);
+            }
+        }
+    }
+    else
+    {
+    struct EdgeKey
+    {
+        double c[6];
+        bool operator<(const EdgeKey& o) const
+        {
+            for (int i = 0; i < 6; ++i)
+            {
+                if (c[i] < o.c[i]) return true;
+                if (c[i] > o.c[i]) return false;
+            }
+            return false;
+        }
+    };
+    auto make_key = [](const vec3& a, const vec3& b) {
+        EdgeKey k;
+        k.c[0] = a.x; k.c[1] = a.y; k.c[2] = a.z;
+        k.c[3] = b.x; k.c[4] = b.y; k.c[5] = b.z;
+        return k;
+    };
+    std::map<EdgeKey, int> edge_use;
     FOR_EACH_HALFEDGE(Map, model, it)
     {
-        if (is_boundary[it])
+        if (it->facet() == nil)
+            continue;
+        const vec3& a = it->vertex()->point();
+        const vec3& b = it->opposite()->vertex()->point();
+        vec3 lo = a, hi = b;
+        if (hi.x < lo.x || (hi.x == lo.x && (hi.y < lo.y || (hi.y == lo.y && hi.z < lo.z))))
+            std::swap(lo, hi);
+        ++edge_use[make_key(lo, hi)];
+    }
+
+    // wall bottoms stop at the highest selected face below the edge, not
+    // at the ground: open edges mid-roof must not grow walls punching
+    // through the storeys underneath. Faces that degenerate to zero
+    // height (cracks between coplanar pieces) are skipped.
+    std::vector<std::pair<Polygon3d, Plane3d> > surfaces; // ring + plane
+    std::vector<Box3d> surface_boxes;
+    {
+        MapFacetAttribute<Plane3d*> supporting_plane(model, "FacetSupportingPlane");
+        FOR_EACH_FACET(Map, model, it)
         {
-            /*
+            Map::Facet* f = it;
+            Plane3d* pl = supporting_plane[f];
+            if (pl == nil || std::abs(pl->normal().z) < 0.1)
+                continue; // vertical faces never shield the ray
+            Polygon3d ring;
+            FacetHalfedgeCirculator cir(f);
+            for (; !cir->end(); ++cir)
+                ring.push_back(cir->halfedge()->vertex()->point());
+            Box3d box;
+            for (std::size_t j = 0; j < ring.size(); ++j)
+                box.add_point(ring[j]);
+            surfaces.push_back(std::make_pair(ring, *pl));
+            surface_boxes.push_back(box);
+        }
+    }
+    auto surface_below = [&](const vec3& p) {
+        double best = -1e30;
+        for (std::size_t i = 0; i < surfaces.size(); ++i)
+        {
+            const Box3d& box = surface_boxes[i];
+            if (p.x < box.x_min() || p.x > box.x_max() || p.y < box.y_min() || p.y > box.y_max())
+                continue;
+            const Polygon3d& ring = surfaces[i].first;
+            bool inside = false;
+            for (std::size_t j = 0, k = ring.size() - 1; j < ring.size(); k = j++)
+            {
+                if ((ring[j].y > p.y) != (ring[k].y > p.y) &&
+					p.x < (ring[k].x - ring[j].x) * (p.y - ring[j].y) / (ring[k].y - ring[j].y) + ring[j].x)
+                    inside = !inside;
+            }
+            if (!inside)
+                continue;
+            const Plane3d& pl = surfaces[i].second;
+            double z = -(pl.a() * p.x + pl.b() * p.y + pl.d()) / pl.c();
+            if (z < p.z - 1e-3 && z > best)
+                best = z;
+        }
+        return best;
+    };
+
+    std::size_t skipped_degenerate = 0;
+    FOR_EACH_HALFEDGE(Map, model, it)
+    {
+        if (it->facet() == nil)
+            continue;
+        const vec3& a = it->vertex()->point();
+        const vec3& b = it->opposite()->vertex()->point();
+        vec3 lo = a, hi = b;
+        if (hi.x < lo.x || (hi.x == lo.x && (hi.y < lo.y || (hi.y == lo.y && hi.z < lo.z))))
+            std::swap(lo, hi);
+        if (edge_use[make_key(lo, hi)] != 1)
+            continue;
+        /*
             b_______a
             |       |
             |       |
             |_______|
             c       d
-            */
+        */
+        vec3 c = ground.projection(b);
+        vec3 d = ground.projection(a);
+        double zc = surface_below(b);
+        double zd = surface_below(a);
+        if (zc > -1e29) c.z = zc;
+        if (zd > -1e29) d.z = zd;
+        if (std::abs(a.z - d.z) < 1e-3 && std::abs(b.z - c.z) < 1e-3)
+        {
+            ++skipped_degenerate; // crack between coplanar pieces: no wall
+            continue;
+        }
+        if (length(c - d) > 1e-4)
+        {
             Polygon3d plg;
-            const vec3 &a = it->vertex()->point();
             plg.push_back(a);
-            const vec3 &b = it->opposite()->vertex()->point();
             plg.push_back(b);
-            const vec3 &c = ground.projection(b);
             plg.push_back(c);
-            const vec3 &d = ground.projection(a);
             plg.push_back(d);
-            auto dis = length(c - d);
-            if (dis > 1e-4)
-            {
-                polygons.push_back(plg);
-            }
+            polygons.push_back(plg);
         }
     }
+    Logger::out("-") << "[extrude] " << polygons.size() << " open edges closed with walls ("
+        << skipped_degenerate << " coplanar cracks skipped)" << std::endl;
+    }
 
-    if (polygons.empty())
-        return;
+	if (polygons.empty())
+		return;
     MapFacetAttribute<Color> color(model, "color");
     MapBuilder builder(model);
     builder.begin_surface();

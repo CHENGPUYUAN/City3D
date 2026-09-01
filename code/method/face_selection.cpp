@@ -26,6 +26,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "../basic/logger.h"
 
 #include <algorithm>
+#include <cstdlib>
 
 FaceSelection::FaceSelection(PointSet* pset, Map* model)
 	: pset_(pset), model_(model)
@@ -185,6 +186,15 @@ std::vector<FaceSelection::FaceStar> FaceSelection::IntersectionAdjacency::extra
 			std::cout << "\t" << pos->first << " - sized fans: " << pos->second << std::endl;
 	}
 #endif
+
+	if (std::getenv("CITY3D_DEBUG_FANS"))
+	{
+		std::map<std::size_t, std::size_t> hist;
+		for (std::size_t i = 0; i < fans.size(); ++i)
+			++hist[fans[i].size()];
+		for (std::map<std::size_t, std::size_t>::iterator h = hist.begin(); h != hist.end(); ++h)
+			std::cout << "[fans] size " << h->first << ": " << h->second << std::endl;
+	}
 
 	MapHalfedgeAttribute<bool> is_boundary(model, "is_boundary");
 	FOR_EACH_HALFEDGE(Map, model, it)
