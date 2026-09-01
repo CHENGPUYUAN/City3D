@@ -614,6 +614,9 @@ Map* HypothesisGenerator::compute_proxy_mesh(PolyFitInfo* polyfit_info, Map::Fac
 {
 
 	Map* mesh = new Map;
+	scissor_planes_.clear(); // stale planes from a previous generate() run
+	scissor_groups_.clear();
+	scissor_group_psets_.clear();
 	MapBuilder builder(mesh);
 
 	MapFacetAttribute<VertexGroup*> facet_supporting_vertex_group(mesh, Method::facet_attrib_supporting_vertex_group);
@@ -878,6 +881,22 @@ Map* HypothesisGenerator::compute_proxy_mesh(PolyFitInfo* polyfit_info, Map::Fac
 
 	// pass 2: build the proxy facets
 	std::size_t num_clip_fallbacks = 0;
+
+	// average footprint z: the ground the seam curtains stand on (see
+	// generate()). The horizontal plane carrying the curtain bottoms is a
+	// source plane (fan bookkeeping) but never a cutter - it owns no facet.
+	const bool curtains_enabled = (std::getenv("CITY3D_CURTAINS") != nil
+		&& std::getenv("CITY3D_CURTAINS")[0] == '1');
+	if (curtains_enabled)
+	{
+		double ground_z = 0.0;
+		for (std::size_t j = 0; j < num_fp; ++j)
+			ground_z += rev[j]->vertex()->point().z;
+		ground_z /= double(num_fp);
+		Plane3d* ground_cut = new Plane3d(vec3(0, 0, ground_z), vec3(0, 0, 1));
+		supporting_planes.push_back(ground_cut);
+	}
+
 	for (std::size_t i = 0; i < planar_segments_.size(); ++i)
 	{
 		VertexGroup* g = planar_segments_[i];
@@ -1139,6 +1158,8 @@ Map* HypothesisGenerator::compute_proxy_mesh(PolyFitInfo* polyfit_info, Map::Fac
 	}
 
 	check_source_planes(mesh);
+
+	polyfit_info->scissor_planes = scissor_planes_;
 
 	return mesh;
 }
@@ -1685,6 +1706,199 @@ Map* HypothesisGenerator::generate(PolyFitInfo* polyfit_info, Map::Facet* footpr
 #if REMOVE_DEGENERATE_FACES
 	remove_degenerated_facets(mesh);
 #endif
+
+	// Seam curtains (CITY3D_CURTAINS=1): the support-region clipping ends
+	// every proxy face on a "scissor" plane with no neighbor face on the
+	// other side, so a seam edge is a fan-1 edge and any selection keeping
+	// the roof piece leaks there. Hanging a real vertical candidate face
+	// from each seam edge down to the footprint ground gives the selection
+	// a partner for those fans (enforced by the curtain-parity constraint
+	// in FaceSelection::optimize). This must happen AFTER pairwise_cut: a
+	// curtain would turn its scissor plane into a cutting plane and blow
+	// up the whole arrangement. The top corners reuse the seam endpoints'
+	// own source triples (bit-identical coordinates), so the curtain fans
+	// up with the seam edge exactly like a cut face would.
+	if (std::getenv("CITY3D_CURTAINS") != nil
+		&& std::getenv("CITY3D_CURTAINS")[0] == '1' && !scissor_planes_.empty())
+	{
+		// ground height of this building's footprint; the matching horizontal
+		// plane was already pushed into the supporting planes by
+		// compute_proxy_mesh (find it back by construction: horizontal,
+		// through the footprint's average z)
+		double gz = 0.0;
+		std::size_t gn = 0;
+		FacetHalfedgeCirculator fcir(footprint);
+		for (; !fcir->end(); ++fcir)
+		{
+			gz += fcir->halfedge()->vertex()->point().z;
+			++gn;
+		}
+		gz /= double(gn > 0 ? gn : 1);
+		Plane3d* ground_cut = nil;
+		for (std::size_t i = 0; i < polyfit_info->planes.size(); ++i)
+		{
+			Plane3d* pl = polyfit_info->planes[i];
+			if (std::abs(pl->normal().z) > 0.99 && pl->squared_ditance(vec3(0, 0, gz)) < 1e-12)
+			{
+				ground_cut = pl;
+				break;
+			}
+		}
+		if (ground_cut != nil)
+		{
+			// group the halfedges into fans by their endpoint source-plane
+			// triples - the same rule IntersectionAdjacency applies later,
+			// duplicated here because it lives in FaceSelection
+			std::map<std::set<Plane3d*>, int> triple_ids;
+			auto triple_id = [&](Map::Vertex* v) -> int {
+				return triple_ids.insert(std::make_pair(vertex_source_planes_[v],
+					static_cast<int>(triple_ids.size()))).first->second;
+			};
+			std::map<std::pair<int, int>, std::pair<int, Map::Halfedge*> > edge_groups; // fan size, one member
+			FOR_EACH_HALFEDGE(Map, mesh, it)
+			{
+				if (it->facet() == nil)
+					continue;
+				int i1 = triple_id(it->opposite()->vertex());
+				int i2 = triple_id(it->vertex());
+				if (i1 > i2)
+					std::swap(i1, i2);
+				std::pair<int, Map::Halfedge*>& e = edge_groups[std::make_pair(i1, i2)];
+				if (e.first == 0)
+					e.second = it;
+				++e.first;
+			}
+
+			// seam candidates: fan-1 edges whose two source planes are one
+			// roof plane and one scissor plane
+			struct CurtainQuad
+			{
+				Plane3d* scissor;
+				std::set<Plane3d*> top_a; // the seam endpoint triples
+				std::set<Plane3d*> top_b;
+				vec3 a, b;
+			};
+			std::vector<CurtainQuad> quads;
+			for (std::map<std::pair<int, int>, std::pair<int, Map::Halfedge*> >::iterator it = edge_groups.begin();
+				it != edge_groups.end(); ++it)
+			{
+				if (it->second.first != 1)
+					continue; // the fan already has partners
+				Map::Halfedge* h = it->second.second;
+				const std::set<Plane3d*>& sa = vertex_source_planes_[h->opposite()->vertex()];
+				const std::set<Plane3d*>& sb = vertex_source_planes_[h->vertex()];
+				std::set<Plane3d*> src;
+				std::set_intersection(sa.begin(), sa.end(), sb.begin(), sb.end(),
+					std::inserter(src, src.begin()));
+				if (src.size() != 2)
+					continue;
+				std::size_t nsc = 0;
+				Plane3d* scissor = nil;
+				for (std::set<Plane3d*>::iterator p = src.begin(); p != src.end(); ++p)
+				{
+					if (scissor_planes_.count(*p) > 0)
+					{
+						++nsc;
+						scissor = *p;
+					}
+				}
+				if (nsc != 1)
+					continue; // footprint seam or scissor-corner edge: not ours
+				const vec3& pa = h->opposite()->vertex()->point();
+				const vec3& pb = h->vertex()->point();
+				if (std::abs(pa.x - pb.x) < 1e-9 && std::abs(pa.y - pb.y) < 1e-9)
+					continue; // vertical edge (shouldn't happen on a roof seam)
+				if (pa.z <= gz + 0.01 || pb.z <= gz + 0.01)
+					continue; // seam at/below ground: nothing to hang
+				CurtainQuad q;
+				q.scissor = scissor;
+				q.top_a = sa;
+				q.top_b = sb;
+				q.a = pa;
+				q.b = pb;
+				quads.push_back(q);
+			}
+
+			if (!quads.empty())
+			{
+				std::map<Plane3d*, VertexGroup*> scissor_groups;
+				MapBuilder builder(mesh);
+				builder.begin_surface();
+				int vid = 0;
+				for (std::size_t k = 0; k < quads.size(); ++k)
+				{
+					const CurtainQuad& q = quads[k];
+					VertexGroup*& gcur = scissor_groups[q.scissor];
+					if (gcur == nil)
+					{
+						// stored in a member: the facet attribute keeps a raw
+						// pointer, so the group must outlive generate()
+						scissor_groups_.push_back(new VertexGroup);
+						gcur = scissor_groups_.back();
+						scissor_group_psets_.push_back(new PointSet);
+						gcur->set_point_set(scissor_group_psets_.back());
+						gcur->set_plane(*q.scissor);
+						vertex_group_plane_[gcur] = q.scissor;
+					}
+
+					// the third plane of each seam endpoint (everything not
+					// shared with the other endpoint)
+					std::vector<Plane3d*> rest_a, rest_b;
+					for (std::set<Plane3d*>::iterator p = q.top_a.begin(); p != q.top_a.end(); ++p)
+						if (q.top_b.count(*p) == 0) rest_a.push_back(*p);
+					for (std::set<Plane3d*>::iterator p = q.top_b.begin(); p != q.top_b.end(); ++p)
+						if (q.top_a.count(*p) == 0) rest_b.push_back(*p);
+
+					builder.begin_facet();
+					builder.add_vertex(q.a);
+					builder.add_vertex_to_facet(vid);
+					++vid;
+					vertex_source_planes_[builder.current_vertex()] = q.top_a;
+					builder.add_vertex(q.b);
+					builder.add_vertex_to_facet(vid);
+					++vid;
+					vertex_source_planes_[builder.current_vertex()] = q.top_b;
+					builder.add_vertex(vec3(q.b.x, q.b.y, gz));
+					builder.add_vertex_to_facet(vid);
+					++vid;
+					std::set<Plane3d*> bot_b;
+					bot_b.insert(q.scissor);
+					if (!rest_b.empty()) bot_b.insert(rest_b[0]);
+					bot_b.insert(ground_cut);
+					vertex_source_planes_[builder.current_vertex()] = bot_b;
+					builder.add_vertex(vec3(q.a.x, q.a.y, gz));
+					builder.add_vertex_to_facet(vid);
+					++vid;
+					std::set<Plane3d*> bot_a;
+					bot_a.insert(q.scissor);
+					if (!rest_a.empty()) bot_a.insert(rest_a[0]);
+					bot_a.insert(ground_cut);
+					vertex_source_planes_[builder.current_vertex()] = bot_a;
+					builder.end_facet();
+					facet_attrib_supporting_plane_[builder.current_facet()] = q.scissor;
+					facet_attrib_supporting_vertex_group_[builder.current_facet()] = gcur;
+				}
+				builder.end_surface();
+
+				// keep the EdgeSourcePlanes attribute consistent for the new
+				// edges (same derivation the rest of the mesh uses)
+				FOR_EACH_HALFEDGE(Map, mesh, it)
+				{
+					Map::Halfedge* h = it;
+					const std::set<Plane3d*>& set1 = vertex_source_planes_[h->prev()->vertex()];
+					const std::set<Plane3d*>& set2 = vertex_source_planes_[h->vertex()];
+					std::set<Plane3d*> faces;
+					std::set_intersection(set1.begin(), set1.end(), set2.begin(), set2.end(),
+						std::inserter(faces, faces.begin()));
+					assert(faces.size() == 2);
+					edge_source_planes_[h] = faces;
+				}
+
+				Logger::out("    -") << "[curtains] " << quads.size() << " curtain faces added on "
+					<< scissor_groups.size() << " scissor planes" << std::endl;
+			}
+		}
+	}
 
 	facet_attrib_supporting_vertex_group_.unbind();
 	facet_attrib_supporting_plane_.unbind();

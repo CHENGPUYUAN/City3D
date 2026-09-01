@@ -27,6 +27,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
 #include <vector>
 #include <string>
+#include <set>
 
 
 class PointSet;
@@ -46,6 +47,10 @@ public:
 	void clear();
 
 	std::vector<Plane3d*>  planes;		// including the bbox face planes
+	// vertical bookkeeping planes of the support-region clipping (the
+	// "scissors" that cut each proxy face out of the footprint). Faces
+	// supported by them are the curtain candidates closing the clip seams.
+	std::set<Plane3d*>		scissor_planes;
 	double				   max_dist;	// maximum distance to the supporting plane
 
 	MapFacetAttribute<VertexGroup*> facet_attrib_supporting_vertex_group;

@@ -266,6 +266,17 @@ bool FaceSelection::optimize(PolyFitInfo* polyfit_info,
 	auto repair_eligible = [&](Map::Facet* f) {
 		return is_excluded(f) && !(is_z_outside.is_bound() && is_z_outside[f]);
 	};
+	// seam curtains (CITY3D_CURTAINS=1): selectable faces on the clipping's
+	// scissor planes. When the seam-adjacent roof piece was excluded by the
+	// marking, the LP parity row above never fired and the solver leaves the
+	// curtain unselected - so the closure repair must be allowed to pull a
+	// curtain in to close an odd seam fan.
+	const bool curtains_on = (std::getenv("CITY3D_CURTAINS") != nil
+		&& std::getenv("CITY3D_CURTAINS")[0] == '1');
+	auto is_curtain = [&](Map::Facet* f) {
+		return curtains_on && !polyfit_info->scissor_planes.empty()
+			&& polyfit_info->scissor_planes.count(facet_attrib_supporting_plane_[f]) > 0;
+	};
 	// number of selectable (non-excluded) members per fan
 	std::vector<std::size_t> fan_active(fans.size(), 0);
 	for (std::size_t i = 0; i < fans.size(); ++i)
@@ -346,6 +357,43 @@ bool FaceSelection::optimize(PolyFitInfo* polyfit_info,
 		}
 	}
 
+	// Curtain parity (CITY3D_CURTAINS=1): a 2-fan made of one roof piece and
+	// one curtain (a face supported by a scissor plane of the support-region
+	// clipping) must be taken together or not at all. Ordinary 2-fans have no
+	// "2 or 0" row in this program, and without one the solver keeps the roof
+	// piece and drops the deep curtain - which is exactly the seam hole the
+	// clipping introduced.
+	std::size_t num_curtain_vars = 0;
+	std::vector<std::pair<MapTypes::Facet*, MapTypes::Facet*> > curtain_pairs;
+	if (curtains_on && !polyfit_info->scissor_planes.empty())
+	{
+		for (std::size_t i = 0; i < fans.size(); ++i)
+		{
+			if (fan_active[i] != 2)
+				continue;
+			const FaceStar& fan = fans[i];
+			MapTypes::Facet* sel[2];
+			std::size_t m = 0;
+			for (std::size_t j = 0; j < fan.size() && m < 2; ++j)
+			{
+				MapTypes::Facet* f = fan[j]->facet();
+				if (!is_excluded(f))
+					sel[m++] = f;
+			}
+			if (m != 2)
+				continue;
+			bool c0 = polyfit_info->scissor_planes.count(facet_attrib_supporting_plane_[sel[0]]) > 0;
+			bool c1 = polyfit_info->scissor_planes.count(facet_attrib_supporting_plane_[sel[1]]) > 0;
+			if (c0 == c1)
+				continue; // two curtains meeting (seam corner) or no curtain at all
+			curtain_pairs.push_back(std::make_pair(sel[0], sel[1]));
+			++num_curtain_vars;
+		}
+		if (!curtain_pairs.empty())
+			Logger::out("    -") << "[curtain-parity] " << curtain_pairs.size()
+				<< " seam fans constrained" << std::endl;
+	}
+
 	FOR_EACH_FACET(Map, model_, it)
 	{
 		Map::Facet* f = it;
@@ -389,7 +437,7 @@ bool FaceSelection::optimize(PolyFitInfo* polyfit_info,
 	}
 	program_.set_objective(obj, LinearProgram::MINIMIZE);
 
-	std::size_t total_variables = num_faces + num_usage_vars + num_sharp_edges;
+	std::size_t total_variables = num_faces + num_usage_vars + num_sharp_edges + num_curtain_vars;
 	typedef LinearProgram::Variable Variable;
 	for (std::size_t i = 0; i < total_variables; ++i)
 	{
@@ -425,6 +473,17 @@ bool FaceSelection::optimize(PolyFitInfo* polyfit_info,
 			constraint.set_bounds(Constraint::FIXED, 0.0, 0.0);
 			program_.add_constraint(constraint);
 		}
+	}
+
+	// curtain seams: roof piece and curtain piece in/out together (x1 + x2 - 2u = 0)
+	for (std::size_t k = 0; k < curtain_pairs.size(); ++k)
+	{
+		Constraint constraint;
+		constraint.add_coefficient(facet_indices[curtain_pairs[k].first], 1.0);
+		constraint.add_coefficient(facet_indices[curtain_pairs[k].second], 1.0);
+		constraint.add_coefficient(num_faces + num_usage_vars + num_sharp_edges + k, -2.0);
+		constraint.set_bounds(Constraint::FIXED, 0.0, 0.0);
+		program_.add_constraint(constraint);
 	}
 
 	FOR_EACH_FACET(Map, model_, it)
@@ -667,17 +726,17 @@ bool FaceSelection::optimize(PolyFitInfo* polyfit_info,
 						if (f == nil || keep.count(f) == 0)
 							continue;
 						Map::Facet* g = fan[j]->opposite()->facet();
-						if (g != nil && keep.count(g) == 0 && repair_eligible(g) &&
-							kept_planes.count(facet_attrib_supporting_plane_[g]) != 0)
-							add = g; // mesh-edge partner on an endorsed plane
+						if (g != nil && keep.count(g) == 0 &&
+							((repair_eligible(g) && kept_planes.count(facet_attrib_supporting_plane_[g]) != 0) || is_curtain(g)))
+							add = g; // mesh-edge partner on an endorsed plane, or a seam curtain
 					}
 					if (add == nil)
 					{
 						for (std::size_t j = 0; j < fan.size() && add == nil; ++j)
 						{
 							Map::Facet* g = fan[j]->facet();
-							if (g != nil && keep.count(g) == 0 && repair_eligible(g) &&
-								kept_planes.count(facet_attrib_supporting_plane_[g]) != 0)
+							if (g != nil && keep.count(g) == 0 &&
+								((repair_eligible(g) && kept_planes.count(facet_attrib_supporting_plane_[g]) != 0) || is_curtain(g)))
 								add = g;
 						}
 					}
@@ -733,7 +792,9 @@ bool FaceSelection::optimize(PolyFitInfo* polyfit_info,
 					for (std::size_t j = 0; j < fan.size(); ++j)
 					{
 						Map::Facet* g = fan[j]->facet();
-						if (g == nil || keep.count(g) != 0 || !repair_eligible(g) || fillers.count(g) != 0)
+						if (g == nil || keep.count(g) != 0 || fillers.count(g) != 0)
+							continue;
+						if (!(repair_eligible(g) || is_curtain(g)))
 							continue;
 						fillers.insert(g);
 						worklist.push_back(std::make_pair(g, depth + 1));

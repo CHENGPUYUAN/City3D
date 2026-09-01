@@ -1004,7 +1004,11 @@ void Reconstruction::extrude_boundary_to_ground(Map *model, const Plane3d &groun
             const vec3 &b = it->opposite()->vertex()->point();
             const vec3 &c = ground.projection(b);
             const vec3 &d = ground.projection(a);
-            if (length(c - d) > 1e-4)
+            // skip zero-height walls: an edge already lying in the ground
+            // plane (e.g. the bottom of a selected curtain) must not grow
+            // a degenerate quad
+            if (length(c - d) > 1e-4
+                && (std::abs(a.z - d.z) > 1e-3 || std::abs(b.z - c.z) > 1e-3))
             {
                 Polygon3d plg;
                 plg.push_back(a);

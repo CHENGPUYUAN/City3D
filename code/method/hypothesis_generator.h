@@ -146,6 +146,11 @@ class HypothesisGenerator
 	// the clipped proxy polygons (as vertex source planes) but never carry
 	// faces and must stay out of the O(n^3) triplet precomputation
 	std::set<Plane3d*> scissor_planes_;
+	// one (empty) support group per scissor plane, for the seam-curtain
+	// facets: the facet attribute stores a raw pointer, so the groups must
+	// outlive generate() - hence this member
+	std::vector<VertexGroup::Ptr> scissor_groups_;
+	std::vector<PointSet::Ptr> scissor_group_psets_;
 };
 
 #endif
