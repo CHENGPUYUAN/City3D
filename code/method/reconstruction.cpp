@@ -884,7 +884,14 @@ Map *Reconstruction::reconstruct_single_building(PointSet *roof_pset,
 
     // in case huge number of candidate faces, we may skip the reconstruction (because no solver can solve the involved
     // optimization problem within a reasonable time window).
-    if (count_selectable_faces(hypothesis) > Method::max_allowed_candidate_faces) {
+    // The pre-marking check uses the raw cap; the post-marking check gets
+    // double: the marked program is far smaller than the full one (the
+    // unsupported faces get no variable) and solves in seconds even at
+    // 40k+ selectable faces, so falling back to the degraded no-detected-
+    // lines model below just because of the full-program-era cap would
+    // throw away quality for nothing.
+    const std::size_t marked_face_cap = 2 * static_cast<std::size_t>(Method::max_allowed_candidate_faces);
+    if (count_selectable_faces(hypothesis) > marked_face_cap) {
         // save footprint
         if (!save_footprint(footprint, roof_pset->offset(), footprint_file_name))
             Logger::err("-") << "failed to save footprint as mesh into file: " << footprint_file_name << std::endl;
@@ -907,7 +914,7 @@ Map *Reconstruction::reconstruct_single_building(PointSet *roof_pset,
             hypothesis = hypo.generate(&polyfit_info, footprint, detected_line_segments);
         }
         measure_and_mark(hypothesis);
-        if (count_selectable_faces(hypothesis) > Method::max_allowed_candidate_faces) { // still too many
+        if (count_selectable_faces(hypothesis) > marked_face_cap) { // still too many
             Logger::err("-") << "too many candidate faces (" << initial_num_candidate_faces << " -> " << hypothesis->size_of_facets() << " by excluding detected lines). Reconstruction skipped, or it would take too much time" << std::endl;
             status = -1;
             return nullptr;

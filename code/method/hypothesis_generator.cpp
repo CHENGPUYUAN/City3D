@@ -103,6 +103,106 @@ static std::list<unsigned int> points_on_plane(VertexGroup* g, const Plane3d& pl
 	return result;
 }
 
+// ---------------------------------------------------------------------
+// Plane-merge gating by 2D overlap: noise splits one physical roof into
+// several detected planes; merging them unions their support regions and
+// removes the interior support-box edges that otherwise dangle open in
+// the clipped arrangement. The gate is the fraction of the smaller
+// group's xy convex hull covered by the other group's hull, so that
+// distant-but-coplanar roofs (same height, disjoint location) stay apart.
+
+namespace {
+
+	double signed_area(const std::vector<vec2>& poly)
+	{
+		double a = 0.0;
+		for (std::size_t i = 0; i < poly.size(); ++i)
+		{
+			const vec2& p = poly[i];
+			const vec2& q = poly[(i + 1) % poly.size()];
+			a += p.x * q.y - q.x * p.y;
+		}
+		return 0.5 * a;
+	}
+
+	// Andrew monotone chain, ccw hull of the xy projection
+	std::vector<vec2> convex_hull_xy(const std::vector<vec3>& points, const VertexGroup* g)
+	{
+		std::vector<vec2> pts;
+		pts.reserve(g->size());
+		for (std::size_t i = 0; i < g->size(); ++i)
+			pts.push_back(vec2(points[g->at(i)].x, points[g->at(i)].y));
+		std::sort(pts.begin(), pts.end(), [](const vec2& a, const vec2& b) {
+			return a.x < b.x || (a.x == b.x && a.y < b.y);
+		});
+		pts.erase(std::unique(pts.begin(), pts.end(), [](const vec2& a, const vec2& b) {
+			return a.x == b.x && a.y == b.y;
+		}), pts.end());
+		if (pts.size() < 3)
+			return pts;
+		std::vector<vec2> hull(2 * pts.size());
+		std::size_t k = 0;
+		auto cross = [](const vec2& o, const vec2& a, const vec2& b) {
+			return (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+		};
+		for (std::size_t i = 0; i < pts.size(); ++i)
+		{
+			while (k >= 2 && cross(hull[k - 2], hull[k - 1], pts[i]) <= 0) --k;
+			hull[k++] = pts[i];
+		}
+		for (std::size_t i = pts.size() - 1, t = k + 1; i > 0; --i)
+		{
+			while (k >= t && cross(hull[k - 2], hull[k - 1], pts[i - 1]) <= 0) --k;
+			hull[k++] = pts[i - 1];
+		}
+		hull.resize(k ? k - 1 : 0);
+		return hull;
+	}
+
+	// proximity-based projection overlap: two hulls "overlap" when one
+	// comes within 'gap' of the other (inside counts as 0). Pure ratio
+	// overlap rejects the most common duplicate shape — noise splitting a
+	// roof into adjacent halves whose hulls barely touch.
+	bool point_near_or_in_convex(const vec2& p, const std::vector<vec2>& hull, double gap)
+	{
+		if (hull.size() < 3)
+			return false;
+		bool inside = true;
+		double best = 1e30;
+		for (std::size_t i = 0; i < hull.size(); ++i)
+		{
+			const vec2& a = hull[i];
+			const vec2& b = hull[(i + 1) % hull.size()];
+			double cr = (b.x - a.x) * (p.y - a.y) - (b.y - a.y) * (p.x - a.x);
+			if (cr < 0)
+				inside = false; // outside this ccw edge
+			double len2 = (b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y);
+			double t = len2 > 0 ? ((p.x - a.x) * (b.x - a.x) + (p.y - a.y) * (b.y - a.y)) / len2 : 0.0;
+			t = std::max(0.0, std::min(1.0, t));
+			double dx = p.x - (a.x + t * (b.x - a.x)), dy = p.y - (a.y + t * (b.y - a.y));
+			best = std::min(best, dx * dx + dy * dy);
+		}
+		return inside || best <= gap * gap;
+	}
+
+	bool hulls_overlap(const std::vector<vec2>& h1, const std::vector<vec2>& h2, double gap)
+	{
+		if (h1.size() < 3 || h2.size() < 3)
+			return false;
+		std::vector<vec2> c1 = h1, c2 = h2;
+		if (signed_area(c1) < 0) std::reverse(c1.begin(), c1.end());
+		if (signed_area(c2) < 0) std::reverse(c2.begin(), c2.end());
+		for (std::size_t i = 0; i < c1.size(); ++i)
+			if (point_near_or_in_convex(c1[i], c2, gap))
+				return true;
+		for (std::size_t i = 0; i < c2.size(); ++i)
+			if (point_near_or_in_convex(c2[i], c1, gap))
+				return true;
+		return false;
+	}
+
+} // namespace
+
 void HypothesisGenerator::merge(VertexGroup* g1, VertexGroup* g2, double max_dist)
 {
 	std::vector<VertexGroup::Ptr>& groups = roof_pset_->groups();
@@ -189,13 +289,31 @@ void HypothesisGenerator::refine_planes()
 	avg_max_dist /= groups.size();
 	avg_max_dist /= 2.0f;
 
-	double theta = 10.0f;                // in degree
+	// merge co-planar vertex groups, gated three ways: similar normal
+	// (CITY3D_MERGE_ANGLE, default 6 degrees), mutual point-to-plane
+	// support (height compatibility, as before), and xy projection
+	// proximity (CITY3D_MERGE_GAP, default 1.0m: hulls overlapping or
+	// closer than the gap). The proximity gate keeps spatially disjoint
+	// but coplanar roofs apart, which the old angle+distance-only
+	// criterion bridged.
+	double merge_angle_deg = 6.0;
+	if (const char* env = std::getenv("CITY3D_MERGE_ANGLE"))
+		merge_angle_deg = std::atof(env);
+	double merge_gap = 1.0;
+	if (const char* env = std::getenv("CITY3D_MERGE_GAP"))
+		merge_gap = std::atof(env);
+	double theta = merge_angle_deg;                // in degree
 	theta = static_cast<double>(M_PI * theta / 180.0f);    // in radian
+	std::size_t num_merged = 0;
 	bool merged = false;
 	do
 	{
 		merged = false;
 		std::sort(groups.begin(), groups.end(), VertexGroupCmpIncreasing());
+
+		std::vector<std::vector<vec2> > hulls(groups.size());
+		for (std::size_t i = 0; i < groups.size(); ++i)
+			hulls[i] = convex_hull_xy(points, groups[i]);
 
 		for (std::size_t i = 0; i < groups.size(); ++i)
 		{
@@ -214,11 +332,15 @@ void HypothesisGenerator::refine_planes()
 				const vec3& n2 = plane2.normal();
 				if (std::abs(dot(n1, n2)) > std::cos(theta))
 				{
+					if (!hulls_overlap(hulls[i], hulls[j], merge_gap))
+						continue; // coplanar but spatially apart: keep separate
+
 					const std::list<unsigned int>& set1on2 = points_on_plane(g1, plane2, avg_max_dist);
 					const std::list<unsigned int>& set2on1 = points_on_plane(g2, plane1, avg_max_dist);
 					if (set1on2.size() > num_threshold && set2on1.size() > num_threshold)
 					{
 						merge(g1, g2, avg_max_dist);
+						++num_merged;
 						merged = true;
 						break;
 					}
@@ -242,7 +364,8 @@ void HypothesisGenerator::refine_planes()
 
 	if (num - groups.size() > 0)
 	{
-//		Logger::out("-") << num - groups.size() << " planar segments merged" << std::endl;
+		Logger::out("    -") << num_merged << " planar segments merged (angle<=" << merge_angle_deg
+			<< "deg, gap<=" << merge_gap << "m)" << std::endl;
 	}
 }
 
