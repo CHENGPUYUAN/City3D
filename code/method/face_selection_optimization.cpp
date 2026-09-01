@@ -414,10 +414,18 @@ bool FaceSelection::optimize(PolyFitInfo* polyfit_info,
 		double num = facet_attrib_supporting_point_num_[f];
 
 		obj.add_coefficient(var_idx, -coeff_data_fitting * num);
-		// accumulate face height  term
-		obj.add_coefficient(var_idx,  coeff_hight * avg_z);
-
+		// accumulate face height  term. Seam curtains are exempt: they carry
+		// no points, so the height term makes them pure cost - and through
+		// the curtain-parity rows that cost rides on the keep decision of
+		// the roof piece they are paired with, dragging marginally-supported
+		// roof faces (small steps near the outline) out of the selection
+		// (case2: LP kept 370 vs 406 baseline, edge points lost their cover).
+		// Free-riding curtains leave the roof economics exactly as baseline.
 		auto v_plane = facet_attrib_supporting_plane_[f];
+		bool seam_curtain = polyfit_info->scissor_planes.count(v_plane) > 0;
+		if (!seam_curtain)
+			obj.add_coefficient(var_idx,  coeff_hight * avg_z);
+
 		bool v_face = false;
 		for (int i = 0; i < v.size(); ++i)
 		{
